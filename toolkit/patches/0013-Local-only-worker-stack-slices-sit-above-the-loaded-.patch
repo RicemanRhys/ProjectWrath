@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 04:25:48 +0000
+Subject: [PATCH] Local-only: worker stack slices sit above the loaded image
+
+XBOX_WORKER_STACK_BASE was XBOX_STACK_BASE (0x00780000), which is inside
+Crash's .data: the 3 MB pool at 0x5EB840 that the game clears and carves.
+The timer thread (every DPC and the vblank ISR) and the OHCI ISR ran their
+frames there. The slices now start at the image's end rounded up to 64 KB
+(Crash: 0x960000..0xD60000), still inside the stack region so the SEH walk
+accepts their frames, with at least 1 MB left for the main thread; an image
+too large for that keeps the old place and says so.
+
+Local change approved by the user (notes 18.49 rule refinement), never pushed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xbox_memory_layout.c | 25 +++++++++++++++++++++++++
+ src/kernel/xbox_memory_layout.h | 20 ++++++++++++++------
+ 2 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 83f844a..9c20d74 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -928,6 +928,10 @@ uint32_t g_xbox_image_hi = 0;
+ uint32_t g_xbox_code_lo = 0;
+ uint32_t g_xbox_code_hi = 0;
+ 
++/* Worker stack slices start above the image (see XBOX_WORKER_STACK_* in the
++ * header); XBOX_STACK_BASE until the image is loaded. */
++uint32_t g_xbox_worker_stack_base = XBOX_STACK_BASE;
++
+ /* Global registers for recompiled code (via recomp_types.h) */
+ /* Each guest thread's TIB. The first thread uses the one the loader built;
+  * a spawned thread gets its own from xbox_AllocThreadTib(). */
+@@ -1613,6 +1617,27 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+ 
+         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
+                 sections_loaded, num_sections, total_bytes);
++
++        /* Worker stack slices above the image, 64 KB aligned, leaving the
++         * main thread at least 1 MB at the top of the stack region. An image
++         * too large for that keeps the old place and says so. */
++        {
++            uint32_t base = (g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu;
++            if (base < XBOX_STACK_BASE)
++                base = XBOX_STACK_BASE;
++            if ((uint64_t)base + XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT
++                    <= (uint64_t)XBOX_STACK_TOP - 0x100000u) {
++                g_xbox_worker_stack_base = base;
++                fprintf(stderr, "  Worker stack slices: %u x %u KB at Xbox VA 0x%08X..0x%08X "
++                                "(above the image, which ends at 0x%08X)\n",
++                        (unsigned)XBOX_WORKER_STACK_COUNT, XBOX_WORKER_STACK_SIZE / 1024,
++                        base, (unsigned)XBOX_WORKER_STACK_END, g_xbox_image_hi);
++            } else {
++                fprintf(stderr, "  WARNING: worker stack slices left at 0x%08X, inside "
++                                "the image (ends 0x%08X): no room above it\n",
++                        g_xbox_worker_stack_base, g_xbox_image_hi);
++            }
++        }
+         if (sections_short) {
+             fprintf(stderr,
+                     "  ERROR: %d section(s) had no data in the image -- the XBE "
+diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
+index 524c763..c38a8c6 100644
+--- a/src/kernel/xbox_memory_layout.h
++++ b/src/kernel/xbox_memory_layout.h
+@@ -378,14 +378,22 @@ extern RECOMP_TLS uint32_t g_fs_base;
+  * code from the host's own message-loop thread, that thread needs a guest stack
+  * (its g_esp starts at 0), which is what a worker slice provides.
+  *
+- * These slices carve the low end of the same 8 MB stack region xbox_AllocThreadStack
+- * uses, and a title uses one model or the other -- never both -- so they do not
+- * coexist at runtime. For a title that never calls xbox_worker_stack_alloc
+- * (every default-model title), this is unused address space and dead code, so
+- * adding it changes nothing for them.
++ * These slices carve the 8 MB stack region, below the main thread's stack.
++ * They start above the loaded image, not at XBOX_STACK_BASE: the region begins
++ * at 0x00780000, and an image can run past that. Crash's .data runs to
++ * 0x00945758, and slice 0 (0x00780000..0x007C0000) sat inside a 3 MB block the
++ * game clears and carves into pieces of its own, so the timer thread's DPCs and
++ * the vblank ISR ran their frames over the game's data. xbox_AllocThreadStack
++ * moved to the heap for the same reason (Half-Life 2). Here the slices stay in
++ * the stack region, so the SEH walk's stack-range check still accepts their
++ * frames. Set once the image is loaded (xbox_MemoryLayoutInit); until then
++ * XBOX_STACK_BASE, which is where they always were for a small image.
++ *
++ * Local change (notes 18.49), not pushed.
+  */
+ #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
+-#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
++extern uint32_t g_xbox_worker_stack_base;
++#define XBOX_WORKER_STACK_BASE   g_xbox_worker_stack_base
+ #define XBOX_WORKER_STACK_COUNT  16                          /* 4 MB total */
+ #define XBOX_WORKER_STACK_END    (XBOX_WORKER_STACK_BASE + \
+                                   XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)

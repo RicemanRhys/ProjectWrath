@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 14:07:48 +0000
+Subject: [PATCH] Local-only: one HRIR scale for both ears
+
+hrtf_filter_set_target_params scaled each ear's taps to sum 1 on its own,
+which removed the level difference between the ears that DirectSound's
+HRIR entries carry (up to ~9 dB for a sound to one side). One scale now:
+the louder ear's taps sum to 1 and the other keeps its level against it.
+Only used with the HRTF on (crash_twoc notes 18.59).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apu/apu_state.h | 20 ++++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 1b88e4d..055bb49 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -227,16 +227,24 @@ hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
+                               float itd) {
+     f->itd_tar = fmaxf(-(float)HRTF_MAX_DELAY_SAMPLES,
+                         fminf(itd, (float)HRTF_MAX_DELAY_SAMPLES));
++    /* One scale for both ears: the louder ear's taps sum to 1 in magnitude
++     * (each ear's did, in xemu), and the other keeps its level against it.
++     * The level difference between the ears is half of the placement:
++     * DirectSound's entries for a sound off to one side differ by up to
++     * ~9 dB (crash_twoc notes 18.59). */
++    float s = 0.0f;
+     for (int ch = 0; ch < 2; ch++) {
+-        float *coeff = f->ch[ch].hrir_coeff_tar;
+-        memcpy(coeff, hrir_coeff[ch], sizeof(f->ch[ch].hrir_coeff_tar));
+-        float s = 0.0f;
++        float sc = 0.0f;
++        memcpy(f->ch[ch].hrir_coeff_tar, hrir_coeff[ch], sizeof(f->ch[ch].hrir_coeff_tar));
+         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+-            s += fabsf(coeff[k]);
++            sc += fabsf(hrir_coeff[ch][k]);
+         }
+-        if (s == 0.0f || s == 1.0f) break;
++        s = fmaxf(s, sc);
++    }
++    if (s == 0.0f) return;
++    for (int ch = 0; ch < 2; ch++) {
+         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+-            coeff[k] /= s;
++            f->ch[ch].hrir_coeff_tar[k] /= s;
+         }
+     }
+ }

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 05:24:15 +0000
+Subject: [PATCH] Local-only: make no frames while the front end is halted
+
+DirectSound halts the APU front end for a moment to edit voice lists.
+The frame thread kept making monitor-only frames meanwhile, so each halt
+was a gap of silence as long as the halt (0.4-2.4% of frames in a level).
+xemu makes none and lets its output queue carry the sound; so does this
+now (only when the software mixer and test tone are idle). The pipeline
+catches up on the resume, paced by the device queue.
+
+Arctic Antics attract demo, 56 s: dropouts 13 -> 0, clicks 81 -> 6
+(with the seam fix); hub sliding, 30 s: dropouts 3 -> 0. Underruns 0.
+
+Local change approved by the user (notes 18.49), never pushed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apu/apu_core.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 5dd8a93..809578c 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -510,6 +510,17 @@ static void *mcpx_apu_frame_thread(void *arg)
+         if (apu_active && !g_test_tone.active) {
+             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+             se_frame(d);
++        } else if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF &&
++                   !g_test_tone.active && !g_mixer_active_count) {
++            /* Halted: DirectSound stops the front end for a moment to edit
++             * voice lists. Making frames here made each halt a gap of
++             * silence as long as the halt (0.4-2.4% of frames in a level).
++             * xemu makes none and lets its output queue carry the sound;
++             * so does this: the device plays what is queued (up to
++             * THROTTLE_QUEUE_TARGET frames) and the pipeline catches up on
++             * the resume. A halt longer than the queue is still an
++             * underrun, counted on the [APU-OUT] line (notes 18.49). */
++            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+         } else {
+             /* Lightweight: just monitor frame (test tone + software mixer) */
+             mcpx_apu_monitor_frame(d);

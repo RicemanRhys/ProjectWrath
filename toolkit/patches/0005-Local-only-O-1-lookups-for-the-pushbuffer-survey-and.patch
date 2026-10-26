@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 11:19:10 +0000
+Subject: [PATCH] Local-only: O(1) lookups for the pushbuffer survey and
+ unhandled-method table
+
+note() and note_unhandled() ran a linear search on every method word, about
+half the NV2A ack thread's time. Both now use a direct index into their
+existing tables. Insertion order is unchanged, and the unhandled index is
+rebuilt after the report's in-place sort, so the [PB] and [GPU] reports are
+identical. Checked against the linear search on 263M + 85M live lookups.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/nv2a_pb_exec.c | 44 +++++++++++++++++++++++++++++++++------
+ src/kernel/nv2a_pb_scan.c | 19 ++++++++++++-----
+ 2 files changed, 52 insertions(+), 11 deletions(-)
+
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 5135394..535cda9 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -277,6 +277,28 @@ typedef struct { uint32_t method, count, last_param; } PbUnhandled;
+ static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
+ static int s_unhandled_count;
+ 
++/* Where each method sits in s_unhandled, plus one; 0 means not there. The
++ * pushbuffer walk gives methods below 0x4000, 4-aligned; anything else falls
++ * back to a search. The report sorts s_unhandled in place, so it rebuilds
++ * this afterwards. */
++#define PB_UNHANDLED_INDEX_SIZE (0x4000 / 4)
++static uint16_t s_unhandled_index[PB_UNHANDLED_INDEX_SIZE];
++
++static int unhandled_indexable(uint32_t method)
++{
++    return method < 0x4000 && !(method & 3);
++}
++
++static void unhandled_reindex(void)
++{
++    int i;
++
++    memset(s_unhandled_index, 0, sizeof s_unhandled_index);
++    for (i = 0; i < s_unhandled_count; i++)
++        if (unhandled_indexable(s_unhandled[i].method))
++            s_unhandled_index[s_unhandled[i].method >> 2] = (uint16_t)(i + 1);
++}
++
+ /* Every texture-stage register, as the title last set it.
+  * Texturing is not implemented yet; knowing which formats and sizes a title
+  * actually programs is what decides which ones are worth implementing. */
+@@ -353,18 +375,27 @@ static void note_unhandled(uint32_t method, uint32_t param)
+     int i;
+ 
+     s_gpu.unhandled_total++;
+-    for (i = 0; i < s_unhandled_count; i++) {
+-        if (s_unhandled[i].method == method) {
+-            s_unhandled[i].count++;
+-            s_unhandled[i].last_param = param;
+-            return;
+-        }
++    if (unhandled_indexable(method)) {
++        i = s_unhandled_index[method >> 2] - 1;
++    } else {
++        for (i = 0; i < s_unhandled_count; i++)
++            if (s_unhandled[i].method == method)
++                break;
++        if (i == s_unhandled_count)
++            i = -1;
++    }
++    if (i >= 0) {
++        s_unhandled[i].count++;
++        s_unhandled[i].last_param = param;
++        return;
+     }
+     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
+         s_unhandled[s_unhandled_count].method = method;
+         s_unhandled[s_unhandled_count].count = 1;
+         s_unhandled[s_unhandled_count].last_param = param;
+         s_unhandled_count++;
++        if (unhandled_indexable(method))
++            s_unhandled_index[method >> 2] = (uint16_t)s_unhandled_count;
+     }
+ }
+ 
+@@ -2020,5 +2051,6 @@ void nv2a_pb_exec_report(void)
+                     v.u, v.f);
+         }
+     }
++    unhandled_reindex();
+     }    fflush(stderr);
+ }
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index ce1196e..2c454b5 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -45,13 +45,21 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ extern void nv2a_pb_exec_report(void);
+ static int s_exec_enabled = -1;
+ 
++/* Where each (subchannel, method) pair sits in s_seen, plus one; 0 means not
++ * seen yet. note() runs on every method word, and a linear search over a few
++ * hundred pairs there was half the executor thread's time. s_seen keeps its
++ * insertion order, so the report is unchanged. The method part is 12 bits,
++ * not 11: an increasing run steps past 0x1FFC (up to 0x1FFC + 0x7FE * 4). */
++#define PB_SEEN_KEY(subch, method) (((subch) << 12) | ((method) >> 2))
++static uint16_t s_seen_index[8u << 12];
++
+ static void note(uint32_t subch, uint32_t method)
+ {
+-    for (int i = 0; i < s_seen_count; i++) {
+-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
+-            s_seen[i].count++;
+-            return;
+-        }
++    uint32_t key = PB_SEEN_KEY(subch, method);
++
++    if (s_seen_index[key]) {
++        s_seen[s_seen_index[key] - 1].count++;
++        return;
+     }
+     if (s_seen_count >= PB_MAX_METHODS) {
+         /* Silently dropping past the cap is how a truncated inventory reads as
+@@ -69,6 +77,7 @@ static void note(uint32_t subch, uint32_t method)
+         s_seen[s_seen_count].subch  = subch;
+         s_seen[s_seen_count].count  = 1;
+         s_seen_count++;
++        s_seen_index[key] = (uint16_t)s_seen_count;
+     }
+ }
+ 

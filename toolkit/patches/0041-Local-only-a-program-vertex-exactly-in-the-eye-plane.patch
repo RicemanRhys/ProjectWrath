@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 08:32:50 +0000
+Subject: [PATCH] Local-only: a program vertex exactly in the eye plane (w = 0)
+ undone through the XDK screen-space tail's rcc(0) clamp, not multiplied back
+ by w (twoc step 106)
+
+An XDK program ends with oPos.xyz = oPos.xyz * c[58] * rcc(oPos.w) + c[59]. The
+translator undid it as (oPos.xyz - c[59]) / c[58] * oPos.w, so a vertex at w = 0
+exactly (the rounding of a large camera position puts a ground vertex there about
+once in a thousand frames while driving) became (0, 0, 0, 0): D3D11 keeps it
+(0 <= z <= w) and draws it at the picture's centre, a flat triangle from there to
+the screen's edge for one frame (Smokey's "silver triangle" on the road, at Game
+(60) and Match display). At w = 0 the position is now divided by the tail's own
+factor, +-1.884467e19 (by w's sign bit), which gives the true clip position, behind
+the near plane, so it is clipped. Every vertex with w != 0 is computed as before
+(the same expression, then a select). twoc's notes 18.109.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/d3d8_vsh.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/d3d8_vsh.c b/src/d3d/d3d8_vsh.c
+index fc7efdf..1e25b08 100644
+--- a/src/d3d/d3d8_vsh.c
++++ b/src/d3d/d3d8_vsh.c
+@@ -573,13 +573,23 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
+      * reserved constants c-38 and c-37). D3D11 wants clip space, so the
+      * mapping is undone with the same two constants; the host viewport then
+      * maps it to the same pixels. A program that writes screen space
+-     * itself is inverted the same way. */
++     * itself is inverted the same way.
++     * A vertex exactly in the eye plane (w = 0, which the rounding of a
++     * large camera position makes now and then) was scaled by the tail's
++     * rcc(0), the clamp +-1.884467e19, and multiplying back by w gave
++     * (0, 0, 0, 0), which D3D11 keeps (0 <= z <= w) and draws at the
++     * picture's centre: a flat triangle from there to the screen's edge for
++     * a frame (twoc step 106, Smokey's road). It is undone through that
++     * factor instead, so it is clipped as the vertex behind the near plane
++     * it is. Every other vertex is computed as before. */
+     sb_append(&sb,
+         "    #undef R12\n"
+         "    VS_OUT o;\n"
+         "    float3 vs = c[58].xyz;\n"
+         "    vs = vs != 0.0 ? vs : 1.0;\n"
+         "    o.pos = float4((oPos.xyz - c[59].xyz) / vs * oPos.w, oPos.w);\n"
++        "    if (oPos.w == 0.0)\n"
++        "        o.pos.xyz = (oPos.xyz - c[59].xyz) / vs / ((asuint(oPos.w) & 0x80000000u) ? -1.884467e+19 : 1.884467e+19);\n"
+         "    o.diffuse  = saturate(oD0);\n"
+         "    o.specular = saturate(oD1);\n"
+         "    o.tex0 = oT0;\n"

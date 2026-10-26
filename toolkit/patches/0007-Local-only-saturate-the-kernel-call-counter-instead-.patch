@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 14:34:20 +0000
+Subject: [PATCH] Local-only: saturate the kernel-call counter instead of
+ wrapping it
+
+g_kernel_call_count is an int. Past 0x7FFFFFFF it read negative,
+KERNEL_LOG_ON() (count <= budget) held again, and every kernel call was
+logged and flushed. A title spinning on KeQuerySystemTime got there in
+about half an hour and then ran at a few frames a second. Output is
+identical up to that point; the count now stops at 0x7FFFFFFF.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/kernel_bridge.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 0f30f1f..82fee1a 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -8839,7 +8839,12 @@ static void kernel_thunk_dispatch(void)
+     ordinal = g_slot_ordinals[slot];
+     bridge = g_slot_bridges[slot];
+ 
+-    g_kernel_call_count++;
++    /* Saturates rather than wrapping. Past 0x7FFFFFFF the count read
++     * negative, KERNEL_LOG_ON() held again, and every call was logged and
++     * flushed: a title that spins on KeQuerySystemTime got there in about
++     * half an hour and then ran at a few frames a second. */
++    if (g_kernel_call_count < 0x7FFFFFFF)
++        g_kernel_call_count++;
+     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
+         g_ordinal_calls[ordinal]++;
+ 

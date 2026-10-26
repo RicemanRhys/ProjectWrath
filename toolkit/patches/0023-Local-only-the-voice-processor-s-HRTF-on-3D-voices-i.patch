@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 14:07:48 +0000
+Subject: [PATCH] Local-only: the voice processor's HRTF on 3D voices, its
+ right ear to the right-hand submixes
+
+g_config.audio.hrtf is on by default (xemu's default), and
+mcpx_apu_set_hrtf / mcpx_apu_get_hrtf switch it at any time. A 3D voice
+the filter ran on mixes its left output into HRTF submixes 0 and 1 and its
+right output into 2 and 3 (DirectSound's left and right pairs); xemu mixes
+channel b % channels there, so a mono 3D voice's left ear went to all four
+and nothing was placed left-right. Off, the mix is as before. For
+crash_twoc's 3D sound placement setting (notes 18.59).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apu/apu.h      |  8 ++++++++
+ src/apu/apu_shim.h |  2 +-
+ src/apu/apu_vp.c   | 21 ++++++++++++++++++++-
+ 3 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/src/apu/apu.h b/src/apu/apu.h
+index a08ffed..1763337 100644
+--- a/src/apu/apu.h
++++ b/src/apu/apu.h
+@@ -37,6 +37,14 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d);
+  * the output unchanged. Any thread, any time. */
+ void mcpx_apu_set_voice_gain(int stream, float gain);
+ 
++/* The voice processor's HRTF filter on 3D voices (on by default, as on the
++ * Xbox): it places them left-right, its left output into the left-hand HRTF
++ * submixes and its right output into the right-hand ones. Off, a 3D voice
++ * goes unfiltered into all four, the same on both sides. Any thread, any
++ * time; it takes effect at the next frame. */
++void mcpx_apu_set_hrtf(int on);
++int mcpx_apu_get_hrtf(void);
++
+ /* The output's channels: 2 (stereo) or 6 (5.1: RECOMP_SPEAKERS=5.1 and a
+  * default device with those speakers; see apu_xaudio2.c), 0 before the
+  * output is open. *device_channels (may be NULL) gets the default device's
+diff --git a/src/apu/apu_shim.h b/src/apu/apu_shim.h
+index de145ca..3a08fe3 100644
+--- a/src/apu/apu_shim.h
++++ b/src/apu/apu_shim.h
+@@ -378,7 +378,7 @@ static struct {
+ } g_config = {
+     .audio = {
+         .volume_limit = 1.0f,
+-        .hrtf = false,
++        .hrtf = true,       /* xemu's default; mcpx_apu_set_hrtf (apu_vp.c) */
+         .vp = { .num_workers = 1 },
+     },
+ };
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index ccf7038..7a675d7 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -100,6 +100,17 @@ void mcpx_apu_set_voice_gain(int stream, float gain)
+     g_voice_gain[stream ? 1 : 0] = gain;
+ }
+ 
++/* g_config.audio.hrtf (apu_shim.h) is this file's own copy: the only reader. */
++void mcpx_apu_set_hrtf(int on)
++{
++    g_config.audio.hrtf = on != 0;
++}
++
++int mcpx_apu_get_hrtf(void)
++{
++    return g_config.audio.hrtf;
++}
++
+ /* ============================================================
+  * Utility functions
+  * ============================================================ */
+@@ -1192,12 +1203,14 @@ static void voice_process(MCPXAPUState *d,
+     }
+ 
+     /* HRTF processing for 3D voices */
++    bool hrtf_done = false;
+     if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
+         uint16_t hrtf_handle =
+             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
+                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
+         if (hrtf_handle != HRTF_NULL_HANDLE) {
+             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
++            hrtf_done = true;
+         }
+     }
+ 
+@@ -1219,8 +1232,14 @@ static void voice_process(MCPXAPUState *d,
+         }
+         g *= attenuate(vol[b]) / hr;
+         g *= kg;
++        /* The HRTF's output is a left and a right ear, and the four HRTF
++         * submixes are two left (0, 1: front, back) and two right (2, 3), as
++         * DirectSound sets them (crash_twoc notes 18.58/18.59). xemu takes
++         * channel b % channels here, so a mono 3D voice's left ear goes to
++         * all four and nothing is placed left-right. */
++        int ch = (hrtf_done && b < 4) ? (b >= 2) : (int)(b % channels);
+         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+-            mixbins[bin[b]][i] += g * samples[i][b % channels];
++            mixbins[bin[b]][i] += g * samples[i][ch];
+         }
+     }
+ 

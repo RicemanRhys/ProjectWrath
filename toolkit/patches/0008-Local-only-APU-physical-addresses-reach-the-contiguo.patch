@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 04:36:42 +0000
+Subject: [PATCH] Local-only: APU physical addresses reach the contiguous
+ window
+
+The emulated APU read every physical address as an offset into the RAM
+at guest VA 0. The runtime keeps contiguous memory in its own window at
+0x80000000 (xbox_memory_layout.c: deliberately not a view of that RAM),
+so the voice array, SGE lists and buffers a title's DSOUND allocates
+there were read from, and written into, low guest memory instead.
+
+apu_phys() now sends an address with APU_PHYS_LOWRAM (bit 26) set to low
+RAM and any other to the contiguous window. The title marks the low-RAM
+buffers it streams from in its own MmGetPhysicalAddress (Crash TWoC's
+twoc/, notes 18.44). Every physical accessor and the stream ADPCM copy go
+through it. Never pushed: a rule refinement for one title, recorded in
+the Crash notes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apu/apu_shim.h | 28 ++++++++++++++++++++++------
+ src/apu/apu_vp.c   |  3 +--
+ 2 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/src/apu/apu_shim.h b/src/apu/apu_shim.h
+index dd6bec1..de145ca 100644
+--- a/src/apu/apu_shim.h
++++ b/src/apu/apu_shim.h
+@@ -95,32 +95,48 @@ static inline void qemu_thread_join(QemuThread *t) {
+ 
+ extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+ 
++/* Local-only (Crash TWoC, never pushed): where a physical address lives.
++ * The runtime keeps contiguous memory in its own window at XBOX_CONTIG_BASE
++ * (0x80000000 + physical offset), not as a view of the RAM at VA 0 (see
++ * xbox_memory_layout.c), so the voice array, SGE lists and buffers that
++ * DSOUND allocates there were read from, and written into, low guest memory.
++ * The title's own MmGetPhysicalAddress (twoc) marks a low-RAM address, one
++ * of the heap buffers DSOUND streams from, with APU_PHYS_LOWRAM; everything
++ * else is a contiguous-window offset. */
++#define APU_PHYS_LOWRAM 0x04000000u
++#define APU_CONTIG_BASE 0x80000000u
++static inline uint8_t *apu_phys(hwaddr addr) {
++    if (addr & APU_PHYS_LOWRAM)
++        return g_apu_ram_ptr + (addr & 0x03FFFFFF);
++    return g_apu_ram_ptr + APU_CONTIG_BASE + (addr & 0x03FFFFFF);
++}
++
+ /* Little-endian physical memory reads */
+ static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
+     (void)as;
+-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
++    return *(uint32_t *)apu_phys(addr);
+ }
+ static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
+     (void)as;
+-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
++    return *(uint16_t *)apu_phys(addr);
+ }
+ static inline uint8_t ldub_phys(void *as, hwaddr addr) {
+     (void)as;
+-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
++    return *(uint8_t *)apu_phys(addr);
+ }
+ 
+ /* Little-endian physical memory writes */
+ static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
+     (void)as;
+-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
++    *(uint32_t *)apu_phys(addr) = val;
+ }
+ static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
+     (void)as;
+-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
++    *(uint16_t *)apu_phys(addr) = val;
+ }
+ static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
+     (void)as;
+-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
++    *(uint8_t *)apu_phys(addr) = val;
+ }
+ 
+ /* Stub address space - just passed to ldl_le_phys etc. (ignored) */
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index b9f429e..a0354c0 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -843,8 +843,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+                 uint32_t linear_addr = block_index * (uint32_t)block_size;
+                 if (stream) {
+                     hwaddr addr = segment_offset + linear_addr;
+-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
+-                           block_size);
++                    memcpy(adpcm_block, apu_phys(addr), block_size);
+                 } else {
+                     linear_addr += ba;
+                     for (unsigned int word_index = 0;

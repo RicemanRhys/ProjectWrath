@@ -1,0 +1,47 @@
+upstream: https://github.com/sp00nznet/xboxrecomp
+pinned commit (upstream's, the base of this project's work): 766ecefcd7fb2a9b344de8ec891f6fe9ea14261b 2026-09-20T05:03:09+00:00 Release v0.11.0 -- "Nothing Said So"
+local commits on top of it: 41 (patches\*.patch, in order; applied with git am)
+the result: the toolkit as Project Wrath builds it (its tree equals the private toolkit's commit 2654828)
+
+SHA-256 of the patches:
+f0de0564ca2c62fc36c0b35fd1515ff9ec8e7f015c0111510cfac746918383c2  0001-Local-only-add-xbox_bridge_resolve_handle-accessor.patch
+0885bd75ea44d92511d2885d9d08cca3606b122a2313285e4e5bf1876ed6e1ff  0002-Local-only-add-xbox_HeapStats-read-only-accessor.patch
+cb15f6ed4a31343c0f675c79fc545adc4a42fc756417a1e73a5650b001972c91  0003-Local-only-read-RECOMP_PB_EXEC_VERBOSE-once-in-the-N.patch
+4e97406697f62222a7fb313ff3a19047a1161fa7ef487fdf84b945a33edd48e3  0004-Local-only-rate-limit-the-per-kick-DMA_PUT-trace-lin.patch
+0a6bda23d9c7b3e5bd26b4ecb417774d818a1ca38451c52dc632f7072ce6c40d  0005-Local-only-O-1-lookups-for-the-pushbuffer-survey-and.patch
+c23d5074a6d2069c0db05a6c66b1e15f7f1a071c02b146c7096f4318a2be8094  0006-Local-only-fix-the-NV2A-vertex-shader-translator-for.patch
+de87d31618d81202a4df6b05363e5107846b72508b9c0eb503aed4cc622e552c  0007-Local-only-saturate-the-kernel-call-counter-instead-.patch
+992767ba055326c8687a5b3af71138f04f79c84eb9517d8a26abd2bb99c522f9  0008-Local-only-APU-physical-addresses-reach-the-contiguo.patch
+8504d00445588b7b855a3ef0a6b748bdc8eca653fb33b693ae70c07619689dc7  0009-Local-only-the-APU-monitor-submits-what-the-VP-produ.patch
+f2470802622aae2774eb781dc15e1dfb0aa68779d41317385b1aa950480d8cea  0010-Local-only-the-VP-resamples-each-voice-to-its-pitch-.patch
+239e855b9f26f58d77ad148bac7f040cabc4db724f14390948f0c8fa1504630a  0011-Local-only-the-KERNEL-summary-goes-to-stderr-in-one-.patch
+f165eda83677a3e7c77e91046c1f8814657159a3a46844319958de41febf7de8  0012-Local-only-the-voice-processor-keeps-rendering-while.patch
+9253f5d72dbe7050cc5c0f3a8091233a5b0232841d36eae0640141cbe3d951e2  0013-Local-only-worker-stack-slices-sit-above-the-loaded-.patch
+91e1e1fc91f8d5352f69495eadbf6585937e454a4ea57228ffbd65b0be1291cc  0014-Local-only-mix-the-bins-down-the-way-the-GP-s-standa.patch
+ba9a28b9f01d147ec7c8ec94cfbd8547a12e2e74ed89e0b98aa25ef08a062acf  0015-Local-only-make-no-frames-while-the-front-end-is-hal.patch
+65a573d4384f605f89de9c659e2c205c108ad9ec5bef1f259234adad97fb2028  0016-Local-only-play-the-last-sample-of-a-stream-segment-.patch
+a9398328df4cbedd8807a02974362bc8f55f8736483acac7e98794674b91809b  0017-Local-only-fog-the-combiner-and-fixed-function-pixel.patch
+ccb24489f689462edddac9a10ddcea80a5aecc2ce5a95a4defac02c41bb2ff83  0018-Local-only-clamp-each-general-combiner-output-to-1-1.patch
+11d786971d4b54b6d83797ccf16c33c16c9c573eb3af639add5178ee065344b0  0019-Local-only-multiply-as-the-NV2A-does-in-vertex-progr.patch
+cc6be38d4a9c0bcccabf7f628ade79e7b0384e4fab08afc184705daa8c029500  0020-Local-only-the-dot-product-texture-modes-in-the-comb.patch
+dc6f34703d9305d2cefcb9f18d0adeefaf24b5eb7653acccc483d200c0bfe813  0021-Local-only-a-gain-per-kind-of-voice-stream-or-buffer.patch
+c45c6cb0dedb0828ee52b1d84d0907ad13e2bde711803479696996d99a4f975a  0022-Local-only-5.1-output-through-XAudio2-when-asked-for.patch
+ef1b33f7071f2666b6f99a62d72d2257d48e38ca0069f9fa3702e1c70abad68b  0023-Local-only-the-voice-processor-s-HRTF-on-3D-voices-i.patch
+5efecafd0522a015aa4d266477ac264dbe575074ffd2b757b19726f55f087d04  0024-Local-only-one-HRIR-scale-for-both-ears.patch
+ef6b00e4a3f478b57e7469316068db75529278d7c8a138770b77adef86355d34  0025-Local-only-the-HRTF-submixes-at-2.6-dB-in-the-mixdow.patch
+df85ec71e4df42491e46988bfb62f420e3906872c12dd96d4d42bfb626c6f00e  0026-Local-only-xbox_d3d8-per-draw-costs-perf-only-identi.patch
+03664a20b6d8fe03294bd12042cb9baee30ca30242b75ab1d859538e30aaa509  0027-Local-only-xbox_d3d8-s-combiner-shader-lookup-perf-o.patch
+0debab45e9ed8099b6fa838733f661756f3bb26338b543100e8f78c0a91b4353  0028-Local-only-xbox_d3d8-skips-binds-and-uploads-that-ch.patch
+d0bdee718da4f529fdf2819e11308cbffbac896d544208d9209a601b3f63ca70  0029-Local-only-xbox_d3d8-UP-draws-drawn-again-from-the-d.patch
+82bad35f5eb557612f8898ce31898ad597f46cb5147712a1fa2882938882f867  0030-Local-only-the-NV2A-ack-thread-can-spin-only-while-i.patch
+a312478339ddae5d10939c48040a32c751a94ad3d216e5ecbd76065d3b947d26  0031-Local-only-xbox_d3d8-baked-draws-a-UP-draw-captured-.patch
+eacbfb65d4fe39da2c737edda2e7ce748d4b017076be971fd186525caf1ee2bb  0032-Local-only-the-APU-frame-thread-s-wakeups-logged-bes.patch
+91b61ab436dba8a57cf4c0e5084f06811a2b8c428a6c474dee4ef01c7bc92799  0033-Local-only-xbox_d3d8-can-time-its-D3D11-context-call.patch
+f18f7652aedd9d964f7a35a034533ebc09ccdbf639b5bc7250a54ff44f94d533  0034-Local-only-a-baked-draw-s-program-constants-as-12-bl.patch
+ea676ceea861f6ede4a33cd6a4d4d08f73a40d9f13461cee2ca02166936afff7  0035-Local-only-a-capture-from-the-game-frame-before-draw.patch
+e128b3db3e77e863d5cf234fee36b47915ca4d4939e5af4cfa5610961f435dae  0036-Local-only-the-context-call-timing-s-comment-twoc-ti.patch
+34c5ec5e2ee7b08e52313bb1363ba210bab3ac880418eeeaa1dcdd71866d0086  0037-Local-only-d3d8_SetPreferredAdapter-the-adapter-the-.patch
+050b5ab121db6683a5d4bd7f31deb1ecd785cdc73f8fa835f95b2c58a23e7ad0  0038-Local-only-d3d8_MemStats-the-bake-s-memory-and-the-r.patch
+81d72002db14ff9ea1229d1bbb06f25c31dad82d4ad1064c6861a49929c993b2  0039-Local-only-the-interpolation-s-camera-correction-in-.patch
+60f68b50fdabca3866ea1adbb2b65678eba12d22732eaabc89c0eb68e1cda11b  0040-Local-only-revert-5c608af-the-interpolation-s-camera.patch
+c6451eb94b2387fa97683d602c7aba2c3275988fa0a37725b245438a98387be1  0041-Local-only-a-program-vertex-exactly-in-the-eye-plane.patch

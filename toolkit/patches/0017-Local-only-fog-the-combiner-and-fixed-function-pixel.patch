@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 15:04:21 +0000
+Subject: [PATCH] Local-only: fog the combiner and fixed-function pixel shaders
+ by distance
+
+The register-combiner shader set FOG to the fog colour, so its alpha (the
+colour's own alpha byte) stood in for the fog factor: every draw with a
+pixel shader was blended toward the fog colour by a constant amount, and
+a final combiner that reads FOG itself was then fogged a second time.
+FOG.a is now the fog factor, computed as the fixed-function pixel shader
+does (table fog per pixel from the view depth, else the vertex's), and
+the extra blend runs only when the final combiner doesn't read FOG.
+
+The fixed-function pixel shader took the table-fog depth as -view z, so
+in D3D's view space (+z ahead) nothing ever fogged; the program path
+negated oFog.x to match. Both now use +z / oFog.x.
+
+Checked against Crash Bandicoot: The Wrath of Cortex (twoc notes 18.51):
+linear table fog 1-36 in Arctic Antics now matches xemu. Smoke tests pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/d3d8_combiners.c | 48 +++++++++++++++++++++++++++++++++++-----
+ src/d3d/d3d8_combiners.h |  3 +++
+ src/d3d/d3d8_shaders.c   |  2 +-
+ src/d3d/d3d8_vsh.c       |  2 +-
+ 4 files changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/src/d3d/d3d8_combiners.c b/src/d3d/d3d8_combiners.c
+index 9a90e7e..2ec27bf 100644
+--- a/src/d3d/d3d8_combiners.c
++++ b/src/d3d/d3d8_combiners.c
+@@ -516,6 +516,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
+     EMIT("    uint   alpha_test_enable;\n");
+     EMIT("    uint   fog_enable;\n");
+     EMIT("    uint4  alpha_only;\n");
++    EMIT("    float4 fog_params;\n");   /* start, end, density, table fog mode */
++    EMIT("    uint   fog_flags;\n");    /* bit 0: table fog, bit 1: range fog */
+     EMIT("};\n\n");
+ 
+     /* ---- Input structure ---- */
+@@ -527,8 +529,23 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
+     EMIT("    float3 tc1     : TEXCOORD1;\n");
+     EMIT("    float3 tc2     : TEXCOORD2;\n");
+     EMIT("    float3 tc3     : TEXCOORD3;\n");
++    EMIT("    float  fog     : TEXCOORD4;\n");   /* vertex fog: the factor */
++    EMIT("    float4 viewpos : TEXCOORD5;\n");   /* table fog: view-space position */
+     EMIT("};\n\n");
+ 
++    /* The fog factor, as the fixed-function pixel shader computes it:
++     * table fog per pixel from the view-space depth, else the vertex's. */
++    EMIT("float fog_factor(PS_IN input) {\n");
++    EMIT("    if (!fog_enable) return 1.0;\n");
++    EMIT("    if (!(fog_flags & 1u)) return saturate(input.fog);\n");
++    EMIT("    float dist = (fog_flags & 2u) ? length(input.viewpos.xyz) : input.viewpos.z;\n");
++    EMIT("    uint mode = (uint)fog_params.w;\n");
++    EMIT("    if (mode == 1u) return saturate(exp(-fog_params.z * dist));\n");
++    EMIT("    if (mode == 2u) { float e = fog_params.z * dist; return saturate(exp(-e * e)); }\n");
++    EMIT("    if (mode == 3u) return saturate((fog_params.y - dist) / max(fog_params.y - fog_params.x, 1e-6));\n");
++    EMIT("    return 1.0;\n");
++    EMIT("}\n\n");
++
+     /* ---- Main function ---- */
+     EMIT("float4 main(PS_IN input) : SV_TARGET {\n");
+ 
+@@ -537,7 +554,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
+     EMIT("    float4 r_zero = float4(0, 0, 0, 0);\n");
+     EMIT("    float4 r_c0   = c0[0];\n");
+     EMIT("    float4 r_c1   = c1[0];\n");
+-    EMIT("    float4 r_fog  = fog_color;\n");
++    /* The NV2A's fog register: the fog colour, and the fog factor in alpha. */
++    EMIT("    float4 r_fog  = float4(fog_color.rgb, fog_factor(input));\n");
+ 
+     /* Vertex colors: Xbox D3DCOLOR is BGRA in memory, the vertex shader
+      * should have already swizzled to RGBA. */
+@@ -765,11 +783,19 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
+         EMIT("    }\n\n");
+     }
+ 
+-    /* ---- Fog ---- */
+-    EMIT("    /* Fog application */\n");
+-    EMIT("    if (fog_enable) {\n");
+-    EMIT("        result.rgb = lerp(fog_color.rgb, result.rgb, r_fog.a);\n");
+-    EMIT("    }\n\n");
++    /* ---- Fog ----
++     * On the NV2A fog is the final combiner's own work (A = FOG.a, B = the
++     * colour, C = FOG.rgb). A final combiner that reads FOG has fogged
++     * already; otherwise fog as D3D's default final combiner would. */
++    for (i = 0; i < 7; i++)
++        if (state->final_input[i].reg == NV2A_REG_FOG)
++            break;
++    if (i == 7) {
++        EMIT("    /* Fog application */\n");
++        EMIT("    if (fog_enable) {\n");
++        EMIT("        result.rgb = lerp(fog_color.rgb, result.rgb, r_fog.a);\n");
++        EMIT("    }\n\n");
++    }
+ 
+     /* ---- Alpha test ---- */
+     EMIT("    /* Alpha test */\n");
+@@ -1049,6 +1075,16 @@ BOOL d3d8_combiners_prepare_draw(void)
+         cb->alpha_func = rs[D3DRS_ALPHAFUNC];
+         cb->alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] ? 1 : 0;
+         cb->fog_enable = rs[D3DRS_FOGENABLE] ? 1 : 0;
++        if (rs[D3DRS_FOGTABLEMODE] != D3DFOG_NONE) {
++            memcpy(&cb->fog_params[0], &rs[D3DRS_FOGSTART], sizeof(float));
++            memcpy(&cb->fog_params[1], &rs[D3DRS_FOGEND], sizeof(float));
++            memcpy(&cb->fog_params[2], &rs[D3DRS_FOGDENSITY], sizeof(float));
++            cb->fog_params[3] = (float)rs[D3DRS_FOGTABLEMODE];
++            cb->fog_flags = 1u | (rs[D3DRS_RANGEFOGENABLE] ? 2u : 0u);
++        } else {
++            cb->fog_params[0] = cb->fog_params[1] = cb->fog_params[2] = cb->fog_params[3] = 0.0f;
++            cb->fog_flags = 0;
++        }
+         for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+             D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(i));
+             cb->alpha_only[i] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+diff --git a/src/d3d/d3d8_combiners.h b/src/d3d/d3d8_combiners.h
+index 09bc506..5f3b6a6 100644
+--- a/src/d3d/d3d8_combiners.h
++++ b/src/d3d/d3d8_combiners.h
+@@ -249,6 +249,9 @@ typedef struct NV2APSConstants {
+     UINT  alpha_test_enable;                /* 0 or 1 */
+     UINT  fog_enable;                       /* 0 or 1 */
+     UINT  alpha_only[NV2A_MAX_TEXTURES];     /* A8 sampling uses white RGB */
++    float fog_params[4];                    /* start, end, density, table fog mode (D3DFOGMODE) */
++    UINT  fog_flags;                        /* bit 0: table fog, bit 1: range fog */
++    UINT  fog_pad[3];
+ } NV2APSConstants;
+ 
+ /* ================================================================
+diff --git a/src/d3d/d3d8_shaders.c b/src/d3d/d3d8_shaders.c
+index 7378396..baab591 100644
+--- a/src/d3d/d3d8_shaders.c
++++ b/src/d3d/d3d8_shaders.c
+@@ -405,7 +405,7 @@ static const char g_ps_tail[] =
+     "        current.rgb = lerp(FogColor.rgb, current.rgb, input.fog);\n"
+     "\n"
+     "    if (PSFlags & 8u) {\n"  /* table fog: compute fog per-pixel from view-space depth */
+-    "        float dist = (PSFlags & 16u) ? length(input.viewpos.xyz) : -input.viewpos.z;\n"
++    "        float dist = (PSFlags & 16u) ? length(input.viewpos.xyz) : input.viewpos.z;\n"  /* D3D view space: +z ahead */
+     "        float f = compute_pfog(dist);\n"
+     "        current.rgb = lerp(FogColor.rgb, current.rgb, f);\n"
+     "    }\n"
+diff --git a/src/d3d/d3d8_vsh.c b/src/d3d/d3d8_vsh.c
+index 8161b60..451875a 100644
+--- a/src/d3d/d3d8_vsh.c
++++ b/src/d3d/d3d8_vsh.c
+@@ -549,7 +549,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
+         "    o.tex2 = oT2.xyz;\n"
+         "    o.tex3 = oT3.xyz;\n"
+         "    o.fog = saturate(oFog.x);\n"          /* vertex fog: the factor */
+-        "    o.viewpos = float4(0.0, 0.0, -oFog.x, 1.0);\n"   /* table fog: the NV2A fogs from oFog.x */
++        "    o.viewpos = float4(0.0, 0.0, oFog.x, 1.0);\n"   /* table fog: the NV2A fogs from oFog.x */
+         "    return o;\n"
+         "}\n");
+ 

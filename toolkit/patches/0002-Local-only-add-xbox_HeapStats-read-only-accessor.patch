@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 05:59:25 +0000
+Subject: [PATCH] Local-only: add xbox_HeapStats read-only accessor
+
+Reports the guest heap's bump high-water mark and size (the pair the
+out-of-memory message already prints) plus live/free totals from the
+existing block table. Read-only: no change to how the allocator behaves.
+
+Added so twoc can print heap occupancy next to the periodic [KERNEL]
+summary and watch the no-split block reuse after its NtFreeVirtualMemory
+fix starts returning blocks to the heap.
+
+Local to this clone only, not raised upstream. See
+'crash claude md/crash-recomp-reference-notes.md' in the outer repo,
+section 18.9 (rule) and 18.28 (this change).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xbox_memory_layout.c | 26 ++++++++++++++++++++++++++
+ src/kernel/xbox_memory_layout.h | 13 +++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 53d8c75..fc6cec7 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -2681,6 +2681,32 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+     return 0;
+ }
+ 
++/* Heap occupancy for a caller's diagnostics: the bump high-water mark and the
++ * total, then what the block table says about the space below the mark. Read
++ * only; nothing here changes what the allocator does. */
++void xbox_HeapStats(xbox_heap_stats_t *out)
++{
++    int i;
++
++    memset(out, 0, sizeof *out);
++    out->used  = g_heap_next - XBOX_HEAP_BASE;
++    out->total = (uint32_t)(XBOX_HEAP_TOP - XBOX_HEAP_BASE);
++    for (i = 0; i < g_heap_block_count; i++) {
++        uint32_t size = g_heap_blocks[i].size;
++        if (!size)
++            continue;       /* merged into a neighbour */
++        if (!g_heap_blocks[i].free) {
++            out->live += size;
++            out->live_blocks++;
++        } else {
++            out->free += size;
++            out->free_blocks++;
++            if (size > out->largest_free)
++                out->largest_free = size;
++        }
++    }
++}
++
+ void xbox_HeapFree(uint32_t xbox_va)
+ {
+     static int frees = 0, matched = 0;
+diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
+index 0098077..524c763 100644
+--- a/src/kernel/xbox_memory_layout.h
++++ b/src/kernel/xbox_memory_layout.h
+@@ -455,6 +455,19 @@ void xbox_HeapFree(uint32_t xbox_va);
+  */
+ uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+ 
++/**
++ * Heap occupancy, for diagnostics. used/total are the bump high-water mark and
++ * the heap size (the pair the out-of-memory message prints); live and free sum
++ * the block table below the mark. Read-only: exposes the allocator's existing
++ * state and changes nothing. Not synchronized, like the allocator itself.
++ */
++typedef struct {
++    uint32_t used, total;
++    uint32_t live, live_blocks;
++    uint32_t free, free_blocks, largest_free;
++} xbox_heap_stats_t;
++void xbox_HeapStats(xbox_heap_stats_t *out);
++
+ /**
+  * Get the file mapping handle for the Xbox memory region.
+  * Used by the VEH handler to map additional mirror views on demand.

@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:28:24 +0000
+Subject: [PATCH] Local-only: add xbox_bridge_resolve_handle accessor
+
+Exposes the existing bridge_resolve_handle() handle-table lookup (already
+used internally for NtClose etc.) to callers outside kernel_bridge.c, with
+no change to what it does or to any other bridge behavior. Read-only,
+does not consume or alter the handle table slot.
+
+Added so a hand-written game-side routine (twoc's GetExitCodeThread
+override) can resolve a guest handle token to the real native HANDLE
+behind it, instead of going through ObReferenceObjectByHandle (which
+this bridge always answers with a null object).
+
+Local to this clone only, not raised upstream. See
+'crash claude md/crash-recomp-reference-notes.md' in the outer repo,
+section 18.9, for the twoc/-side rule this falls under and why.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ src/kernel/kernel_bridge.c      | 12 ++++++++++++
+ src/kernel/xbox_memory_layout.h | 11 +++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 5b56513..0f30f1f 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -2557,6 +2557,18 @@ static HANDLE bridge_resolve_handle(uint32_t token)
+     return (HANDLE)(uintptr_t)token;
+ }
+ 
++/* Public wrapper for bridge_resolve_handle (xbox_memory_layout.h). Additive:
++ * exposes this one existing lookup to callers outside this file, with no
++ * change to what it does or to any other bridge behavior. Added so a
++ * hand-written game-side routine (e.g. a title's GetExitCodeThread, which
++ * needs the real thread HANDLE, not another round trip through the bridge's
++ * own always-null ObReferenceObjectByHandle) can resolve a guest handle
++ * token without duplicating the handle table. */
++HANDLE xbox_bridge_resolve_handle(uint32_t token)
++{
++    return bridge_resolve_handle(token);
++}
++
+ static HANDLE bridge_take_handle(uint32_t token)
+ {
+     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+diff --git a/src/kernel/xbox_memory_layout.h b/src/kernel/xbox_memory_layout.h
+index 23df8b2..0098077 100644
+--- a/src/kernel/xbox_memory_layout.h
++++ b/src/kernel/xbox_memory_layout.h
+@@ -500,4 +500,15 @@ void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline
+ #define XBOX_THREAD_MODE_SPAWN  1
+ void xbox_SetThreadMode(int mode);
+ 
++/* Resolve a bridge handle token (as stored in guest memory by
++ * bridge_write_handle -- CreateThread, CreateEvent, CreateFile, ...) back to
++ * the real native HANDLE behind it, for a hand-written game-side routine that
++ * needs the host object itself rather than another bridge call. Read-only:
++ * does not consume or alter the handle table slot (see bridge_resolve_handle
++ * in kernel_bridge.c, which this only exposes). An untagged/unknown token, or
++ * one with no live entry, returns NULL. Purely additive: no bridge behavior
++ * changes, this only makes an existing internal lookup reachable from
++ * outside kernel_bridge.c. */
++HANDLE xbox_bridge_resolve_handle(uint32_t token);
++
+ #endif /* XBOX_MEMORY_LAYOUT_H */

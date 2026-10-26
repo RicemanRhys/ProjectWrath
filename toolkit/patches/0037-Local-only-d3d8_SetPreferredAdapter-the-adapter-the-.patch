@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:28:21 +0000
+Subject: [PATCH] Local-only: d3d8_SetPreferredAdapter, the adapter the next
+ CreateDevice is made on (never called: D3D11's default adapter, as before;
+ twoc step 97's graphics card choice)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/d3d8_device.c   | 17 +++++++++++++++--
+ src/d3d/d3d8_internal.h |  4 ++++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/src/d3d/d3d8_device.c b/src/d3d/d3d8_device.c
+index 116d1a3..dda841e 100644
+--- a/src/d3d/d3d8_device.c
++++ b/src/d3d/d3d8_device.c
+@@ -195,6 +195,19 @@ UINT                 d3d8_GetNumLights(void) {
+  * D3D11 initialization helpers
+  * ================================================================ */
+ 
++/* Local (twoc step 97): the graphics card the next CreateDevice uses. Never
++ * set (NULL), the device is made on D3D11's default adapter, as before. */
++static IDXGIAdapter *g_preferred_adapter;
++
++void d3d8_SetPreferredAdapter(IDXGIAdapter *adapter)
++{
++    if (adapter)
++        IDXGIAdapter_AddRef(adapter);
++    if (g_preferred_adapter)
++        IDXGIAdapter_Release(g_preferred_adapter);
++    g_preferred_adapter = adapter;
++}
++
+ static HRESULT d3d11_create_device_and_swap_chain(
+     D3D8DeviceState *state,
+     D3DPRESENT_PARAMETERS *pp)
+@@ -223,8 +236,8 @@ static HRESULT d3d11_create_device_and_swap_chain(
+     scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+ 
+     hr = D3D11CreateDeviceAndSwapChain(
+-        NULL,
+-        D3D_DRIVER_TYPE_HARDWARE,
++        g_preferred_adapter,
++        g_preferred_adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+         NULL,
+         create_flags,
+         NULL, 0,
+diff --git a/src/d3d/d3d8_internal.h b/src/d3d/d3d8_internal.h
+index acb559a..df29b52 100644
+--- a/src/d3d/d3d8_internal.h
++++ b/src/d3d/d3d8_internal.h
+@@ -170,6 +170,10 @@ ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
+ HWND                 d3d8_GetHWND(void);
+ UINT                 d3d8_GetBackbufferWidth(void);
+ UINT                 d3d8_GetBackbufferHeight(void);
++/* Local (twoc step 97): the adapter the next CreateDevice is made on (kept
++ * with a reference); NULL, also when never called, is D3D11's default
++ * adapter as before. */
++void                 d3d8_SetPreferredAdapter(IDXGIAdapter *adapter);
+ 
+ /* Presentation-only gamma. End restores the saved backbuffer even if Present fails. */
+ void d3d8_gamma_set(const D3DGAMMARAMP *ramp);

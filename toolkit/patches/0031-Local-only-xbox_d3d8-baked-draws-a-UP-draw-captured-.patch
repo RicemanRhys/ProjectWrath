@@ -1,0 +1,1236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 22:29:02 +0000
+Subject: [PATCH] Local-only: xbox_d3d8 baked draws: a UP draw captured once
+ and drawn again from what it bound (perf only, identical output)
+
+- d3d8_BakeCapture / d3d8_DrawBaked (d3d8_internal.h, D3D8Baked): the next
+  UP draw is captured as it is made, after its translation: the vertex and
+  pixel shaders, input layout, blend, depth-stencil and rasterizer objects,
+  stencil reference, samplers, viewport, the constant buffers bound, the
+  fixed-function transform and lighting constants and the pixel constants
+  as uploaded (into a per-frame bake memory, identical blocks shared), and
+  where the rings hold its vertices and indices. d3d8_DrawBaked draws it
+  again with the caller's texture views and program constants (or the
+  fixed-function matrices given again: ff_xf_matrices, the ordinary path's
+  own code), binding only what differs from what is bound. xbox_d3d8's D3D8
+  state is left as it was; what the buffers hold is kept true (the held
+  copies updated, or the next ordinary draw uploads again).
+- Captures stay valid while d3d8_bake_gen and the rings' generation are
+  unchanged: the VSH cache's eviction, the combiners' LRU eviction, the
+  fixed-function pixel shaders' eviction and a full sampler cache bump it.
+- Blend, depth-stencil and rasterizer objects are cached by description
+  (64 each) instead of released and created again at every change, so a
+  capture can hold them; the runtime returns the same object for the same
+  description, so the same objects are bound as before.
+- With D3D11.1 constant-buffer offsets, a captured program draw's 192
+  registers go into a 32 MB constants ring (each at its own offset, the
+  block before reused while they haven't changed), and a baked draw whose
+  registers are unchanged binds the capture's block; a moved one writes a
+  new block. Without offsets: g_vsh_cb as before.
+- d3d8_BakeReset (a capturing frame's start): the bake memory reused, and
+  the vertex, index and constant rings started over when they may not hold
+  the frame (the last frame's bytes, a quarter more and 1 MB): a ring that
+  started over in the middle of a frame took the captures before it with it.
+- tests/d3d8_smoke/test_a8.c: stubs for the new symbols it doesn't link.
+
+For twoc's sub-frames (each recorded frame drawn up to four times; twoc's
+RECOMP_D3D_BRIDGE_BAKE). Under the twoc notes' 18.63 rule refinement
+(perf-only changes in xbox_d3d8, local, never pushed); twoc notes 18.90.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/d3d8_combiners.c   |  56 ++++++++++
+ src/d3d/d3d8_device.c      | 192 ++++++++++++++++++++++++++++++++++
+ src/d3d/d3d8_internal.h    |  78 +++++++++++++-
+ src/d3d/d3d8_shaders.c     | 207 ++++++++++++++++++++++++++++++-------
+ src/d3d/d3d8_states.c      | 101 ++++++++++++++----
+ src/d3d/d3d8_vsh.c         | 183 ++++++++++++++++++++++++++++++++
+ tests/d3d8_smoke/test_a8.c |   7 ++
+ 7 files changed, 767 insertions(+), 57 deletions(-)
+
+diff --git a/src/d3d/d3d8_combiners.c b/src/d3d/d3d8_combiners.c
+index b466e74..176473c 100644
+--- a/src/d3d/d3d8_combiners.c
++++ b/src/d3d/d3d8_combiners.c
+@@ -1021,6 +1021,7 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
+         entry = &g_cache[lru_slot];
+         if (entry->shader) {
+             ID3D11PixelShader_Release(entry->shader);
++            d3d8_bake_gen++;            /* a baked draw may hold it (twoc notes 18.90) */
+         }
+ 
+         ps = compile_combiner_shader(state);
+@@ -1043,6 +1044,8 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
+  * when a draw's constants differ). */
+ static NV2APSConstants g_cb_held;
+ static ID3D11Buffer *g_cb_held_by;
++static const void *g_cb_baked_last;     /* 18.90: the baked block it holds, NULL: not one */
++static const void *g_cb_captured;       /* 18.90: the frame's last captured block */
+ 
+ HRESULT d3d8_combiners_init(void)
+ {
+@@ -1055,6 +1058,7 @@ HRESULT d3d8_combiners_init(void)
+     g_dirty = TRUE;
+     g_frame_counter = 0;
+     g_cb_held_by = NULL;
++    d3d8_combiners_bake_reset();
+ 
+     /* Create the PS constant buffer for combiner shaders.
+      * Size must match NV2APSConstants, rounded up to 16-byte alignment. */
+@@ -1206,6 +1210,7 @@ BOOL d3d8_combiners_prepare_draw(void)
+                 ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);
+                 g_cb_held = *cb;
+                 g_cb_held_by = g_combiner_cb;
++                g_cb_baked_last = NULL;
+             }
+         }
+     }
+@@ -1218,3 +1223,54 @@ BOOL d3d8_combiners_prepare_draw(void)
+ 
+     return TRUE;
+ }
++
++/* Twoc notes 18.90, a draw captured: the constants its combiner shader has
++ * (what the buffer holds after d3d8_combiners_prepare_draw), in the bake's
++ * memory; the block captured before when they are the same. NULL if the
++ * buffer doesn't hold them. */
++const void *d3d8_combiners_bake(UINT *bytes)
++{
++    void *p;
++
++    *bytes = sizeof(NV2APSConstants);
++    if (g_cb_held_by != g_combiner_cb)
++        return NULL;
++    if (g_cb_captured && memcmp(g_cb_captured, &g_cb_held, sizeof(g_cb_held)) == 0)
++        return g_cb_captured;
++    p = d3d8_bake_alloc(sizeof(g_cb_held));
++    if (p) {
++        memcpy(p, &g_cb_held, sizeof(g_cb_held));
++        g_cb_captured = p;
++    }
++    return p;
++}
++
++/* A baked draw's combiner constants into the buffer, unless it holds them. */
++void d3d8_combiners_baked_upload(const void *consts)
++{
++    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
++    D3D11_MAPPED_SUBRESOURCE mapped;
++
++    if (consts == g_cb_baked_last)
++        return;
++    if (g_cb_held_by != g_combiner_cb || memcmp(&g_cb_held, consts, sizeof(g_cb_held)) != 0) {
++        if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_combiner_cb, 0, D3D11_MAP_WRITE_DISCARD, 0,
++                                           &mapped))) {
++            g_cb_held_by = NULL;
++            g_cb_baked_last = NULL;
++            return;
++        }
++        memcpy(mapped.pData, consts, sizeof(g_cb_held));
++        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);
++        memcpy(&g_cb_held, consts, sizeof(g_cb_held));
++        g_cb_held_by = g_combiner_cb;
++    }
++    g_cb_baked_last = consts;
++}
++
++/* The frame's captures begin again (d3d8_BakeReset). */
++void d3d8_combiners_bake_reset(void)
++{
++    g_cb_captured = NULL;
++    g_cb_baked_last = NULL;
++}
+diff --git a/src/d3d/d3d8_device.c b/src/d3d/d3d8_device.c
+index 7ebc781..2999383 100644
+--- a/src/d3d/d3d8_device.c
++++ b/src/d3d/d3d8_device.c
+@@ -18,6 +18,8 @@
+ #include "d3d8_internal.h"
+ #include <stdio.h>
+ #include <string.h>
++#include <stdlib.h>
++#include <stdint.h>
+ 
+ /* ================================================================
+  * Internal device state
+@@ -778,6 +780,10 @@ static UINT          g_ib_ring_offset = 0;
+  * D3D8UpKept). */
+ static UINT          g_ring_gen = 1;
+ 
++/* Bytes put into each ring since the last d3d8_BakeReset, and in the frame
++ * before it (twoc notes 18.90). */
++static UINT          g_up_frame_bytes, g_ib_frame_bytes;
++
+ static HRESULT up_ring_init(void)
+ {
+     D3D11_BUFFER_DESC bd;
+@@ -839,6 +845,7 @@ static UINT up_ring_upload(const void *data, UINT size, UINT stride)
+         (ID3D11Resource *)g_up_ring_buffer, 0);
+ 
+     g_up_ring_offset = offset + size;
++    g_up_frame_bytes += size + stride;
+     return offset;
+ }
+ 
+@@ -874,6 +881,7 @@ static UINT ib_ring_upload(const void *data, UINT size)
+     memcpy((BYTE *)mapped.pData + offset, data, size);
+     ID3D11DeviceContext_Unmap(g_device_state.d3d11_context, (ID3D11Resource *)g_ib_ring_buffer, 0);
+     g_ib_ring_offset = (offset + size + 15) & ~15;
++    g_ib_frame_bytes += size + 16;
+     return offset;
+ }
+ 
+@@ -931,6 +939,59 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
+     return S_OK;
+ }
+ 
++/* Baked draws (twoc notes 18.90, d3d8_internal.h): the draw being captured,
++ * NULL none. */
++static D3D8Baked *g_bake_cap;
++
++/* The UP draw about to be made, with everything bound, captured into `b`. */
++static void bake_fill(D3D8Baked *b, D3D11_PRIMITIVE_TOPOLOGY topology, UINT stride, DXGI_FORMAT ib_format,
++                      UINT count, UINT start, INT base)
++{
++    const D3D8Bound *k = &g_d3d8_bound;
++    const D3DVIEWPORT8 *v = &g_device_state.viewport;
++    void *none;
++    int i;
++
++    memset(&none, 0xFF, sizeof(none));  /* d3d8_bound_reset's: nothing bound yet */
++    g_bake_cap = NULL;
++    b->gen = 0;
++    b->vs = k->vs;
++    b->il = k->il;
++    b->ps = k->ps;
++    b->bs = k->bs;
++    b->dss = k->dss;
++    b->rs = k->rs;
++    b->stencil_ref = k->stencil_ref;
++    for (i = 0; i < 4; i++)
++        b->samp[i] = k->samp[i];
++    b->vs_cb[0] = k->vs_cb[0];
++    b->vs_cb[1] = k->vs_cb[1];
++    b->ps_cb = k->ps_cb;
++    if ((void *)b->vs == none || (void *)b->il == none || (void *)b->ps == none || (void *)b->bs == none ||
++        (void *)b->dss == none || (void *)b->rs == none || (void *)b->vs_cb[1] == none || (void *)b->ps_cb == none)
++        return;
++    for (i = 0; i < 4; i++)
++        if ((void *)b->samp[i] == none)
++            return;
++    b->vp.TopLeftX = (FLOAT)v->X;       /* as dev_SetViewport bound it */
++    b->vp.TopLeftY = (FLOAT)v->Y;
++    b->vp.Width = (FLOAT)v->Width;
++    b->vp.Height = (FLOAT)v->Height;
++    b->vp.MinDepth = v->MinZ;
++    b->vp.MaxDepth = v->MaxZ;
++    b->topology = topology;
++    b->stride = stride;
++    b->ib_format = ib_format;
++    b->count = count;
++    b->start = start;
++    b->base = base;
++    b->ring_gen = g_ring_gen;
++    d3d8_shaders_bake(b);               /* sets gen when the constants are known */
++    d3d8_vsh_bake(b);                   /* where the ring holds a program's */
++    if (b->gen && !b->vsh && (void *)b->vs_cb[0] == none)
++        b->gen = 0;
++}
++
+ /* DrawPrimitiveUP; with `kept` (18.79, D3D8UpKept) the vertices a draw
+  * uploaded before, while the ring still holds them. */
+ static HRESULT draw_primitive_up(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexData,
+@@ -981,6 +1042,9 @@ static HRESULT draw_primitive_up(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveC
+     d3d8_states_apply();
+ 
+     d3d8_bind_topology(g_device_state.d3d11_context, topology);
++    if (g_bake_cap)
++        bake_fill(g_bake_cap, topology, VertexStreamZeroStride, DXGI_FORMAT_UNKNOWN, vertex_count,
++                  ring_offset / VertexStreamZeroStride, 0);
+     ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, ring_offset / VertexStreamZeroStride);
+     return S_OK;
+ }
+@@ -1048,6 +1112,9 @@ static HRESULT draw_indexed_primitive_up(D3DPRIMITIVETYPE PrimitiveType, UINT Nu
+     d3d8_states_apply();
+ 
+     d3d8_bind_topology(g_device_state.d3d11_context, topology);
++    if (g_bake_cap)
++        bake_fill(g_bake_cap, topology, VertexStreamZeroStride, ib_fmt, index_count, ib_offset / idx_bytes,
++                  (INT)(vb_offset / VertexStreamZeroStride));
+     ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, ib_offset / idx_bytes,
+                                     (INT)(vb_offset / VertexStreamZeroStride));
+     return S_OK;
+@@ -1068,6 +1135,131 @@ HRESULT d3d8_DrawIndexedPrimitiveUPKept(D3DPRIMITIVETYPE PrimitiveType, UINT Num
+                                      pVertexData, VertexStreamZeroStride, kept);
+ }
+ 
++/* The bake's memory: chunks kept from frame to frame, emptied at
++ * d3d8_BakeReset. */
++typedef struct bake_chunk {
++    struct bake_chunk *next;
++    size_t used, cap;
++    double data[1];
++} bake_chunk;
++#define BAKE_CHUNK (256u * 1024u)
++static bake_chunk *g_bake_head, *g_bake_cur;
++
++void *d3d8_bake_alloc(size_t n)
++{
++    bake_chunk *c = g_bake_cur;
++    void *p;
++
++    n = (n + 15) & ~(size_t)15;
++    while (c && c->used + n > c->cap)
++        c = c->next;                    /* emptied ones after it, from frames before */
++    if (!c) {
++        size_t cap = n > BAKE_CHUNK ? n : BAKE_CHUNK;
++        c = (bake_chunk *)malloc(sizeof(bake_chunk) + cap);
++        if (!c)
++            return NULL;
++        c->used = 0;
++        c->cap = cap;
++        c->next = NULL;
++        if (g_bake_cur) {
++            c->next = g_bake_cur->next;
++            g_bake_cur->next = c;
++        } else {
++            c->next = g_bake_head;
++            g_bake_head = c;
++        }
++    }
++    g_bake_cur = c;
++    p = (uint8_t *)c->data + c->used;
++    c->used += n;
++    return p;
++}
++
++void d3d8_BakeReset(void)
++{
++    bake_chunk *c;
++
++    /* A ring that started over in the middle of a frame took every capture
++     * before it with it, for the frame's later passes (~6% of their draws in
++     * cast_bug): one that may not hold this frame's uploads after the last
++     * frame's (with a quarter more and 1 MB) starts over at its next upload,
++     * here at the frame's start. */
++    if ((UINT64)g_up_ring_offset + g_up_frame_bytes + g_up_frame_bytes / 4 + (1u << 20) > UP_RING_BUFFER_SIZE)
++        g_up_ring_offset = UP_RING_BUFFER_SIZE;
++    if ((UINT64)g_ib_ring_offset + g_ib_frame_bytes + g_ib_frame_bytes / 4 + (1u << 20) > IB_RING_BUFFER_SIZE)
++        g_ib_ring_offset = IB_RING_BUFFER_SIZE;
++    g_up_frame_bytes = g_ib_frame_bytes = 0;
++    for (c = g_bake_head; c; c = c->next)
++        c->used = 0;
++    g_bake_cur = g_bake_head;
++    g_bake_cap = NULL;
++    d3d8_shaders_bake_reset();
++}
++
++BOOL d3d8_bake_capturing(void)
++{
++    return g_bake_cap != NULL;
++}
++
++void d3d8_BakeCapture(D3D8Baked *b)
++{
++    if (b)
++        b->gen = 0;
++    g_bake_cap = b;
++}
++
++HRESULT d3d8_DrawBaked(const D3D8Baked *b, ID3D11ShaderResourceView *const srv[4], const float *vs_consts, BOOL fresh,
++                       const D3DMATRIX *const ff_m[3])
++{
++    ID3D11DeviceContext *ctx = g_device_state.d3d11_context;
++    static const float blend_factor[4] = { 1, 1, 1, 1 };
++    DWORD s;
++
++    if (!b->gen || b->gen != d3d8_bake_gen || b->ring_gen != g_ring_gen || (b->vsh && !vs_consts))
++        return S_FALSE;
++    g_d3d_draw_count++;
++    d3d8_bind_vs(ctx, b->vs);
++    d3d8_bind_layout(ctx, b->il);
++    if (b->vsh) {
++        d3d8_vsh_baked_consts(b, vs_consts, fresh);     /* and b1 bound */
++    } else {
++        d3d8_bind_vs_cb(ctx, 0, b->vs_cb[0]);
++        d3d8_bind_vs_cb(ctx, 1, b->vs_cb[1]);
++    }
++    d3d8_shaders_baked_upload(b, ff_m); /* the fixed-function and pixel constants */
++    d3d8_bind_ps(ctx, b->ps);
++    d3d8_bind_ps_cb(ctx, b->ps_cb);
++    if (g_d3d8_bound.bs != b->bs) {     /* as d3d8_states_apply binds them */
++        g_d3d8_bound.bs = b->bs;
++        ID3D11DeviceContext_OMSetBlendState(ctx, b->bs, blend_factor, 0xFFFFFFFF);
++    }
++    if (g_d3d8_bound.dss != b->dss || g_d3d8_bound.stencil_ref != b->stencil_ref) {
++        g_d3d8_bound.dss = b->dss;
++        g_d3d8_bound.stencil_ref = b->stencil_ref;
++        ID3D11DeviceContext_OMSetDepthStencilState(ctx, b->dss, b->stencil_ref);
++    }
++    if (g_d3d8_bound.rs != b->rs) {
++        g_d3d8_bound.rs = b->rs;
++        ID3D11DeviceContext_RSSetState(ctx, b->rs);
++    }
++    for (s = 0; s < 4; s++)
++        if (g_d3d8_bound.samp[s] != b->samp[s]) {
++            g_d3d8_bound.samp[s] = b->samp[s];
++            ID3D11DeviceContext_PSSetSamplers(ctx, s, 1, &b->samp[s]);
++        }
++    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 4, srv);  /* as dev_SetTexture, every stage */
++    ID3D11DeviceContext_RSSetViewports(ctx, 1, &b->vp);         /* as dev_SetViewport, every draw */
++    d3d8_bind_vb(ctx, g_up_ring_buffer, b->stride, 0);
++    if (b->ib_format != DXGI_FORMAT_UNKNOWN)
++        d3d8_bind_ib(ctx, g_ib_ring_buffer, b->ib_format, 0);
++    d3d8_bind_topology(ctx, b->topology);
++    if (b->ib_format != DXGI_FORMAT_UNKNOWN)
++        ID3D11DeviceContext_DrawIndexed(ctx, b->count, b->start, b->base);
++    else
++        ID3D11DeviceContext_Draw(ctx, b->count, b->start);
++    return S_OK;
++}
++
+ static HRESULT __stdcall dev_CreateTexture(IDirect3DDevice8 *self, UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture8 **ppTexture)
+ {
+     (void)self; (void)Pool;
+diff --git a/src/d3d/d3d8_internal.h b/src/d3d/d3d8_internal.h
+index d54c99d..37d594e 100644
+--- a/src/d3d/d3d8_internal.h
++++ b/src/d3d/d3d8_internal.h
+@@ -336,6 +336,7 @@ typedef struct {
+     ID3D11RasterizerState   *rs;
+     ID3D11SamplerState      *samp[4];
+     ID3D11Buffer            *vs_cb[2];
++    UINT                     vs_cb1_first;  /* slot 1's first constant (twoc notes 18.90: the constants ring) */
+     ID3D11Buffer            *ps_cb;
+     ID3D11Buffer            *vb;        /* IA slot 0 */
+     UINT                     vb_stride, vb_offset;
+@@ -374,8 +375,10 @@ static __inline void d3d8_bind_layout(ID3D11DeviceContext *ctx, ID3D11InputLayou
+ 
+ static __inline void d3d8_bind_vs_cb(ID3D11DeviceContext *ctx, UINT slot, ID3D11Buffer *cb)
+ {
+-    if (g_d3d8_bound.vs_cb[slot] != cb) {
++    if (g_d3d8_bound.vs_cb[slot] != cb || (slot == 1 && g_d3d8_bound.vs_cb1_first)) {
+         g_d3d8_bound.vs_cb[slot] = cb;
++        if (slot == 1)
++            g_d3d8_bound.vs_cb1_first = 0;
+         ID3D11DeviceContext_VSSetConstantBuffers(ctx, slot, 1, &cb);
+     }
+ }
+@@ -437,6 +440,79 @@ HRESULT d3d8_DrawIndexedPrimitiveUPKept(D3DPRIMITIVETYPE PrimitiveType, UINT Num
+                                         const void *pIndexData, D3DFORMAT IndexDataFormat,
+                                         const void *pVertexData, UINT VertexStreamZeroStride, D3D8UpKept *kept);
+ 
++/* ================================================================
++ * Baked draws (d3d8_device.c)
++ *
++ * Local perf change (twoc notes 18.90): a caller that draws the same UP
++ * draw several times (twoc's sub-frames) has the first draw captured: what
++ * it bound on the D3D11 context once its render states, stage states,
++ * shaders and constants were translated (the pipeline objects, samplers,
++ * viewport, the fixed-function and pixel constants as uploaded, where the
++ * rings hold its vertices). d3d8_DrawBaked draws it again from that, binding
++ * what differs from what is bound, with only the vertex program's
++ * constants (or the fixed-function matrices) given again; nothing is
++ * translated and xbox_d3d8's own D3D8 state is left as it was. With D3D11.1's
++ * constant-buffer offsets a captured program's registers go into a ring
++ * (d3d8_vsh.c), where a baked draw with them unchanged binds them again; and
++ * d3d8_BakeReset starts the rings over when the frame may not fit. The objects
++ * a capture points to stay alive while d3d8_bake_gen is unchanged: every
++ * cache that releases one bumps it (and a bake from before is refused).
++ * ================================================================ */
++
++typedef struct {
++    UINT gen;                           /* d3d8_bake_gen when captured, 0: not captured */
++    UINT ring_gen;                      /* the rings' generation then */
++    ID3D11VertexShader      *vs;
++    ID3D11InputLayout       *il;
++    ID3D11PixelShader       *ps;
++    ID3D11BlendState        *bs;
++    ID3D11DepthStencilState *dss;
++    ID3D11RasterizerState   *rs;
++    ID3D11SamplerState      *samp[4];
++    ID3D11Buffer            *vs_cb[2], *ps_cb;
++    UINT                     stencil_ref;
++    D3D11_VIEWPORT           vp;
++    D3D11_PRIMITIVE_TOPOLOGY topology;
++    UINT                     stride;
++    DXGI_FORMAT              ib_format;         /* DXGI_FORMAT_UNKNOWN: not indexed */
++    UINT                     count, start;      /* vertices or indices, the first */
++    INT                      base;              /* the base vertex (indexed) */
++    BOOL                     vsh;               /* a vertex program (its constants in b1) */
++    UINT                     k_gen, k_first;    /* where the constants ring holds them (k_gen 0: not there) */
++    const void              *ff_xf, *ff_lt;     /* fixed-function: its transform and lighting constants */
++    const void              *ps_consts;         /* the pixel constants, as in ps_cb */
++    UINT                     ps_bytes;
++} D3D8Baked;
++
++extern UINT d3d8_bake_gen;
++
++/* The captures of a new frame begin: the memory the last frame's held is
++ * reused. */
++void d3d8_BakeReset(void);
++/* The next UP draw is captured into `b` (gen set when it is); NULL: none. */
++void d3d8_BakeCapture(D3D8Baked *b);
++/* `b` drawn again with stage s sampling srv[s]. A vertex program's
++ * constants are `vs_consts` (192 float4s); `fresh` says they are not the
++ * block given at the last baked draw unchanged (or `ff_m` world, view and
++ * projection replace a fixed-function draw's matrices, NULL: as captured).
++ * Returns S_FALSE without drawing when the capture no longer holds (draw it
++ * the ordinary way). */
++HRESULT d3d8_DrawBaked(const D3D8Baked *b, ID3D11ShaderResourceView *const srv[4], const float *vs_consts, BOOL fresh,
++                       const D3DMATRIX *const ff_m[3]);
++
++/* The modules' parts (d3d8_shaders.c, d3d8_combiners.c, d3d8_vsh.c) */
++void *d3d8_bake_alloc(size_t n);
++void d3d8_shaders_bake(D3D8Baked *b);
++void d3d8_shaders_baked_upload(const D3D8Baked *b, const D3DMATRIX *const ff_m[3]);
++void d3d8_shaders_bake_reset(void);
++const void *d3d8_combiners_bake(UINT *bytes);
++void d3d8_combiners_baked_upload(const void *consts);
++void d3d8_combiners_bake_reset(void);
++void d3d8_vsh_baked_consts(const D3D8Baked *b, const float *consts, BOOL fresh);
++void d3d8_vsh_bake_reset(void);
++void d3d8_vsh_bake(D3D8Baked *b);
++BOOL d3d8_bake_capturing(void);
++
+ #endif /* _WIN32 -- end of D3D11 backend section */
+ 
+ #endif /* BURNOUT3_D3D8_INTERNAL_H */
+diff --git a/src/d3d/d3d8_shaders.c b/src/d3d/d3d8_shaders.c
+index de5517e..a719b33 100644
+--- a/src/d3d/d3d8_shaders.c
++++ b/src/d3d/d3d8_shaders.c
+@@ -530,6 +530,7 @@ static ID3D11PixelShader *ff_ps_get_shader(UINT sig)
+     if (g_ff_ps_cache_count >= FF_PS_CACHE_SIZE) {
+         /* Evict the oldest entry */
+         ID3D11PixelShader_Release(g_ff_ps_cache[0].ps);
++        d3d8_bake_gen++;                /* a baked draw may hold it (twoc notes 18.90) */
+         memmove(&g_ff_ps_cache[0], &g_ff_ps_cache[1],
+                 (FF_PS_CACHE_SIZE - 1) * sizeof(FfPsCacheEntry));
+         g_ff_ps_cache_count--;
+@@ -617,6 +618,18 @@ typedef struct {
+ static PSConstants g_ps_held;
+ static ID3D11Buffer *g_ps_held_by;
+ 
++/* Twoc notes 18.90, baked draws: the fixed-function constants the last draw
++ * uploaded (built here, then copied into the buffers), whether its vertex
++ * shader was a program and its pixel shader the combiners', the blocks the
++ * frame's last capture made, and the baked blocks each buffer holds (NULL:
++ * not one). */
++static VSTransformConstants g_ff_xf;
++static VSLightingConstants g_ff_lt;
++static BOOL g_prep_vsh, g_prep_comb;
++static BOOL g_ff_ok;                    /* both fixed-function buffers filled from them */
++static const void *g_xf_captured, *g_lt_captured, *g_ps_captured;
++static const void *g_xf_baked_last, *g_lt_baked_last, *g_ps_baked_last;
++
+ /* ================================================================
+  * Input layout cache (FVF → ID3D11InputLayout)
+  * ================================================================ */
+@@ -904,6 +917,47 @@ void d3d8_shaders_shutdown(void)
+  * Pre-draw binding
+  * ================================================================ */
+ 
++/* The transform constants' matrices and eye position from world, view and
++ * projection (ff_vs_prepare_draw's, and twoc notes 18.90's baked draws with
++ * their matrices given again). */
++static void ff_xf_matrices(VSTransformConstants *cb, const D3DMATRIX *world, const D3DMATRIX *view,
++                           const D3DMATRIX *proj)
++{
++    float wv[16], wvp[16], wvp_t[16], world_t[16];
++    float world_inv[16], world_inv_t[16];
++    float wv_t[16], wv_inv[16], wv_inv_t[16];
++
++    mat4_mul(wv, (const float *)world, (const float *)view);
++    mat4_mul(wvp, wv, (const float *)proj);
++    mat4_transpose(wvp_t, wvp);
++    memcpy(cb->wvp, wvp_t, sizeof(wvp_t));
++
++    mat4_transpose(world_t, (const float *)world);
++    memcpy(cb->world, world_t, sizeof(world_t));
++
++    /* WorldInvTranspose = transpose(inverse(world)) */
++    mat4_inverse(world_inv, (const float *)world);
++    mat4_transpose(world_inv_t, world_inv);
++    memcpy(cb->world_inv_transpose, world_inv_t, sizeof(world_inv_t));
++
++    /* WorldView (camera space) and its inverse-transpose */
++    mat4_transpose(wv_t, wv);
++    memcpy(cb->world_view, wv_t, sizeof(wv_t));
++    mat4_inverse(wv_inv, wv);
++    mat4_transpose(wv_inv_t, wv_inv);
++    memcpy(cb->world_view_inv_transpose, wv_inv_t, sizeof(wv_inv_t));
++
++    /* Compute eye position from inverse view matrix */
++    {
++        float view_inv[16];
++        mat4_inverse(view_inv, (const float *)view);
++        cb->eye_pos[0] = view_inv[12];
++        cb->eye_pos[1] = view_inv[13];
++        cb->eye_pos[2] = view_inv[14];
++        cb->eye_pos[3] = 1.0f;
++    }
++}
++
+ static void ff_vs_prepare_draw(DWORD fvf)
+ {
+     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+@@ -929,7 +983,7 @@ static void ff_vs_prepare_draw(DWORD fvf)
+     /* ---- VS Transform CB (b0) ---- */
+     hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vs_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+     if (SUCCEEDED(hr)) {
+-        VSTransformConstants *cb = (VSTransformConstants *)mapped.pData;
++        VSTransformConstants *cb = &g_ff_xf;   /* built here, then copied (18.90) */
+         UINT i;
+         memset(cb, 0, sizeof(*cb));
+ 
+@@ -944,47 +998,14 @@ static void ff_vs_prepare_draw(DWORD fvf)
+             cb->screen_h = (float)d3d8_GetBackbufferHeight();
+             cb->flags = 0x01; /* pre-transformed */
+         } else {
+-            float wv[16], wvp[16], wvp_t[16], world_t[16];
+-            float world_inv[16], world_inv_t[16];
+-            float wv_t[16], wv_inv[16], wv_inv_t[16];
+-
+             world = d3d8_GetTransform(D3DTS_WORLD);
+             view  = d3d8_GetTransform(D3DTS_VIEW);
+             proj  = d3d8_GetTransform(D3DTS_PROJECTION);
+-
+-            mat4_mul(wv, (const float *)world, (const float *)view);
+-            mat4_mul(wvp, wv, (const float *)proj);
+-            mat4_transpose(wvp_t, wvp);
+-            memcpy(cb->wvp, wvp_t, sizeof(wvp_t));
+-
+-            mat4_transpose(world_t, (const float *)world);
+-            memcpy(cb->world, world_t, sizeof(world_t));
+-
+-            /* WorldInvTranspose = transpose(inverse(world)) */
+-            mat4_inverse(world_inv, (const float *)world);
+-            mat4_transpose(world_inv_t, world_inv);
+-            memcpy(cb->world_inv_transpose, world_inv_t, sizeof(world_inv_t));
+-
+-            /* WorldView (camera space) and its inverse-transpose */
+-            mat4_transpose(wv_t, wv);
+-            memcpy(cb->world_view, wv_t, sizeof(wv_t));
+-            mat4_inverse(wv_inv, wv);
+-            mat4_transpose(wv_inv_t, wv_inv);
+-            memcpy(cb->world_view_inv_transpose, wv_inv_t, sizeof(wv_inv_t));
++            ff_xf_matrices(cb, world, view, proj);
+ 
+             cb->screen_w = (float)d3d8_GetBackbufferWidth();
+             cb->screen_h = (float)d3d8_GetBackbufferHeight();
+             cb->flags = 0;
+-
+-            /* Compute eye position from inverse view matrix */
+-            {
+-                float view_inv[16];
+-                mat4_inverse(view_inv, (const float *)view);
+-                cb->eye_pos[0] = view_inv[12];
+-                cb->eye_pos[1] = view_inv[13];
+-                cb->eye_pos[2] = view_inv[14];
+-                cb->eye_pos[3] = 1.0f;
+-            }
+         }
+ 
+         if (fvf & D3DFVF_DIFFUSE) cb->flags |= 0x02;
+@@ -1024,13 +1045,16 @@ static void ff_vs_prepare_draw(DWORD fvf)
+             cb->texcoord_index[i] = ts ? ts[D3DTSS_TEXCOORDINDEX] : (UINT)i;
+         }
+ 
++        memcpy(mapped.pData, cb, sizeof(*cb));
+         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vs_cb, 0);
++        g_xf_baked_last = NULL;
++        g_ff_ok = TRUE;
+     }
+ 
+     /* ---- VS Lighting CB (b1) ---- */
+     hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vs_light_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+     if (SUCCEEDED(hr)) {
+-        VSLightingConstants *lb = (VSLightingConstants *)mapped.pData;
++        VSLightingConstants *lb = &g_ff_lt;    /* built here, then copied (18.90) */
+         const D3DMATERIAL8 *mat = d3d8_GetMaterial();
+         UINT i, active_count = 0;
+         memset(lb, 0, sizeof(*lb));
+@@ -1089,7 +1113,11 @@ static void ff_vs_prepare_draw(DWORD fvf)
+         }
+         lb->num_lights = active_count;
+ 
++        memcpy(mapped.pData, lb, sizeof(*lb));
+         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vs_light_cb, 0);
++        g_lt_baked_last = NULL;
++    } else {
++        g_ff_ok = FALSE;
+     }
+ 
+     d3d8_bind_vs_cb(ctx, 0, g_vs_cb);
+@@ -1192,6 +1220,7 @@ static void ff_ps_prepare_draw(ID3D11DeviceContext *ctx)
+                 ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ps_cb, 0);
+                 g_ps_held = *pc;
+                 g_ps_held_by = g_ps_cb;
++                g_ps_baked_last = NULL;
+             }
+         }
+     }
+@@ -1204,13 +1233,115 @@ void d3d8_shaders_prepare_draw(DWORD handle)
+     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+ 
+     if (!ctx) return;
+-    if (!d3d8_vsh_prepare_draw(handle))
++    g_ff_ok = FALSE;
++    g_prep_vsh = d3d8_vsh_prepare_draw(handle);
++    if (!g_prep_vsh)
+         ff_vs_prepare_draw(handle);
+ 
+     /* Pixel state is independent of whether the vertex shader is
+      * programmable: the combiners' shader when one is set and it has one,
+      * else the fixed-function one (18.79: that was built and bound at every
+      * draw, then replaced by the combiners'). */
+-    if (!d3d8_combiners_prepare_draw())
++    g_prep_comb = d3d8_combiners_prepare_draw();
++    if (!g_prep_comb)
+         ff_ps_prepare_draw(ctx);
+ }
++
++/* Twoc notes 18.90: `n` bytes of the bake's memory holding `p`, or `last`
++ * (the block the capture before made) when it holds the same. */
++static const void *bake_block(const void *p, size_t n, const void **last)
++{
++    void *q;
++
++    if (*last && memcmp(*last, p, n) == 0)
++        return *last;
++    if ((q = d3d8_bake_alloc(n)) == NULL)
++        return NULL;
++    memcpy(q, p, n);
++    *last = q;
++    return q;
++}
++
++/* A draw captured (d3d8_device.c, after its preparation): whether its vertex
++ * shader is a program, the fixed-function constants it uploaded, its pixel
++ * constants. b->gen is left 0 when they aren't all known. */
++void d3d8_shaders_bake(D3D8Baked *b)
++{
++    b->vsh = g_prep_vsh;
++    b->ff_xf = b->ff_lt = NULL;
++    if (!g_prep_vsh) {
++        if (!g_ff_ok)
++            return;
++        b->ff_xf = bake_block(&g_ff_xf, sizeof(g_ff_xf), &g_xf_captured);
++        b->ff_lt = bake_block(&g_ff_lt, sizeof(g_ff_lt), &g_lt_captured);
++        if (!b->ff_xf || !b->ff_lt)
++            return;
++    }
++    if (g_prep_comb) {
++        b->ps_consts = d3d8_combiners_bake(&b->ps_bytes);
++    } else {
++        b->ps_bytes = sizeof(PSConstants);
++        b->ps_consts = g_ps_held_by == g_ps_cb ? bake_block(&g_ps_held, sizeof(g_ps_held), &g_ps_captured) : NULL;
++    }
++    if (!b->ps_consts)
++        return;
++    b->gen = d3d8_bake_gen;
++}
++
++/* One constant buffer filled with `n` bytes from `p`. */
++static void cb_fill(ID3D11Buffer *cb, const void *p, size_t n)
++{
++    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
++    D3D11_MAPPED_SUBRESOURCE mapped;
++
++    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
++        memcpy(mapped.pData, p, n);
++        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)cb, 0);
++    }
++}
++
++/* A baked draw's fixed-function and pixel constants into their buffers,
++ * those a buffer holds already left (a block's address is the capture's:
++ * the same address, the same constants). `ff_m` (world, view, projection)
++ * gives the transform's matrices again, the rest as captured. */
++void d3d8_shaders_baked_upload(const D3D8Baked *b, const D3DMATRIX *const ff_m[3])
++{
++    if (!b->vsh) {
++        const VSTransformConstants *xf = (const VSTransformConstants *)b->ff_xf;
++        if (ff_m && !(xf->flags & 0x01)) {
++            VSTransformConstants x = *xf;
++            ff_xf_matrices(&x, ff_m[0], ff_m[1], ff_m[2]);
++            cb_fill(g_vs_cb, &x, sizeof(x));
++            g_xf_baked_last = NULL;
++        } else if (b->ff_xf != g_xf_baked_last) {
++            cb_fill(g_vs_cb, b->ff_xf, sizeof(VSTransformConstants));
++            g_xf_baked_last = b->ff_xf;
++        }
++        if (b->ff_lt != g_lt_baked_last) {
++            cb_fill(g_vs_light_cb, b->ff_lt, sizeof(VSLightingConstants));
++            g_lt_baked_last = b->ff_lt;
++        }
++    }
++    if (b->ps_cb == g_ps_cb) {
++        if (b->ps_consts != g_ps_baked_last) {
++            if (g_ps_held_by != g_ps_cb || memcmp(&g_ps_held, b->ps_consts, sizeof(g_ps_held)) != 0) {
++                cb_fill(g_ps_cb, b->ps_consts, sizeof(g_ps_held));
++                memcpy(&g_ps_held, b->ps_consts, sizeof(g_ps_held));
++                g_ps_held_by = g_ps_cb;
++            }
++            g_ps_baked_last = b->ps_consts;
++        }
++    } else {
++        d3d8_combiners_baked_upload(b->ps_consts);
++    }
++}
++
++/* The frame's captures begin again (d3d8_BakeReset): blocks are made anew,
++ * perhaps where last frame's were. */
++void d3d8_shaders_bake_reset(void)
++{
++    g_xf_captured = g_lt_captured = g_ps_captured = NULL;
++    g_xf_baked_last = g_lt_baked_last = g_ps_baked_last = NULL;
++    d3d8_combiners_bake_reset();
++    d3d8_vsh_bake_reset();
++}
+diff --git a/src/d3d/d3d8_states.c b/src/d3d/d3d8_states.c
+index e72bc68..2b18a6d 100644
+--- a/src/d3d/d3d8_states.c
++++ b/src/d3d/d3d8_states.c
+@@ -52,6 +52,66 @@ static DWORD g_last_blend_hash = 0;
+ static DWORD g_last_raster_hash = 0;
+ static D3D11_DEPTH_STENCIL_DESC g_last_ds_desc;
+ 
++/* Blend, depth-stencil and rasterizer objects by description (local perf
++ * change, twoc notes 18.90): each made once and kept, where one was released
++ * and created again at every change, so a baked draw can hold them. The
++ * runtime gives the object it already has for a description it has seen, so
++ * the same description binds the same object as before. Full: all released
++ * and started again (d3d8_bake_gen bumped). */
++#define STATE_CACHE_MAX 64
++typedef struct {
++    union {
++        D3D11_BLEND_DESC blend;
++        D3D11_DEPTH_STENCIL_DESC ds;
++        D3D11_RASTERIZER_DESC raster;
++    } desc;
++    IUnknown *state;
++} StateCacheEntry;
++static StateCacheEntry g_state_cache[3][STATE_CACHE_MAX];
++static unsigned g_state_cache_n[3];
++UINT d3d8_bake_gen = 1;
++
++static void state_cache_release(void)
++{
++    unsigned k, i;
++
++    for (k = 0; k < 3; k++) {
++        for (i = 0; i < g_state_cache_n[k]; i++)
++            IUnknown_Release(g_state_cache[k][i].state);
++        g_state_cache_n[k] = 0;
++    }
++    d3d8_bake_gen++;
++}
++
++/* The object kept for description `d` (`size` bytes) of kind `k`, NULL if
++ * none yet. */
++static IUnknown *state_cache_find(unsigned k, const void *d, size_t size)
++{
++    unsigned i;
++
++    for (i = 0; i < g_state_cache_n[k]; i++)
++        if (memcmp(&g_state_cache[k][i].desc, d, size) == 0)
++            return g_state_cache[k][i].state;
++    return NULL;
++}
++
++/* Keep `state` (one reference, the cache's) for description `d`. */
++static void state_cache_add(unsigned k, const void *d, size_t size, IUnknown *state)
++{
++    unsigned i;
++
++    if (g_state_cache_n[k] == STATE_CACHE_MAX) {
++        for (i = 0; i < g_state_cache_n[k]; i++)
++            IUnknown_Release(g_state_cache[k][i].state);
++        g_state_cache_n[k] = 0;
++        d3d8_bake_gen++;
++    }
++    i = g_state_cache_n[k]++;
++    memset(&g_state_cache[k][i].desc, 0, sizeof(g_state_cache[k][i].desc));
++    memcpy(&g_state_cache[k][i].desc, d, size);
++    g_state_cache[k][i].state = state;
++}
++
+ /* ================================================================
+  * D3D8 → D3D11 enum translation
+  * ================================================================ */
+@@ -156,11 +216,7 @@ static void update_blend_state(const DWORD *rs)
+ 
+     if (hash == g_last_blend_hash && g_blend_state) return;
+     g_last_blend_hash = hash;
+-
+-    if (g_blend_state) {
+-        ID3D11BlendState_Release(g_blend_state);
+-        g_blend_state = NULL;
+-    }
++    g_blend_state = NULL;               /* the cache's (18.90) */
+ 
+     memset(&bd, 0, sizeof(bd));
+     bd.RenderTarget[0].BlendEnable = rs[D3DRS_ALPHABLENDENABLE] ? TRUE : FALSE;
+@@ -172,9 +228,13 @@ static void update_blend_state(const DWORD *rs)
+     bd.RenderTarget[0].BlendOpAlpha = bd.RenderTarget[0].BlendOp;
+     bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(rs[D3DRS_COLORWRITEENABLE] & 0x0F);
+ 
++    if ((g_blend_state = (ID3D11BlendState *)state_cache_find(0, &bd, sizeof(bd))) != NULL)
++        return;
+     hr = ID3D11Device_CreateBlendState(d3d8_GetD3D11Device(), &bd, &g_blend_state);
+     if (FAILED(hr))
+         fprintf(stderr, "D3D8: CreateBlendState failed: 0x%08lX\n", hr);
++    else
++        state_cache_add(0, &bd, sizeof(bd), (IUnknown *)g_blend_state);
+ }
+ 
+ static void update_depth_stencil_state(const DWORD *rs)
+@@ -200,16 +260,19 @@ static void update_depth_stencil_state(const DWORD *rs)
+     /* Zeroed padding makes the complete descriptor comparable; the reference
+      * is bound separately. */
+     if (g_ds_state && memcmp(&dsd, &g_last_ds_desc, sizeof(dsd)) == 0) return;
+-    if (g_ds_state) {
+-        ID3D11DepthStencilState_Release(g_ds_state);
+-        g_ds_state = NULL;
+-    }
++    g_ds_state = NULL;                  /* the cache's (18.90) */
+ 
++    if ((g_ds_state = (ID3D11DepthStencilState *)state_cache_find(1, &dsd, sizeof(dsd))) != NULL) {
++        memcpy(&g_last_ds_desc, &dsd, sizeof(dsd));
++        return;
++    }
+     hr = ID3D11Device_CreateDepthStencilState(d3d8_GetD3D11Device(), &dsd, &g_ds_state);
+     if (FAILED(hr))
+         fprintf(stderr, "D3D8: CreateDepthStencilState failed: 0x%08lX\n", hr);
+-    else
++    else {
+         memcpy(&g_last_ds_desc, &dsd, sizeof(dsd));
++        state_cache_add(1, &dsd, sizeof(dsd), (IUnknown *)g_ds_state);
++    }
+ }
+ 
+ static void update_rasterizer_state(const DWORD *rs)
+@@ -220,11 +283,7 @@ static void update_rasterizer_state(const DWORD *rs)
+ 
+     if (hash == g_last_raster_hash && g_raster_state) return;
+     g_last_raster_hash = hash;
+-
+-    if (g_raster_state) {
+-        ID3D11RasterizerState_Release(g_raster_state);
+-        g_raster_state = NULL;
+-    }
++    g_raster_state = NULL;              /* the cache's (18.90) */
+ 
+     memset(&rd, 0, sizeof(rd));
+ 
+@@ -247,9 +306,13 @@ static void update_rasterizer_state(const DWORD *rs)
+     rd.MultisampleEnable = FALSE;
+     rd.AntialiasedLineEnable = FALSE;
+ 
++    if ((g_raster_state = (ID3D11RasterizerState *)state_cache_find(2, &rd, sizeof(rd))) != NULL)
++        return;
+     hr = ID3D11Device_CreateRasterizerState(d3d8_GetD3D11Device(), &rd, &g_raster_state);
+     if (FAILED(hr))
+         fprintf(stderr, "D3D8: CreateRasterizerState failed: 0x%08lX\n", hr);
++    else
++        state_cache_add(2, &rd, sizeof(rd), (IUnknown *)g_raster_state);
+ }
+ 
+ /* ================================================================
+@@ -353,6 +416,7 @@ void d3d8_states_apply_sampler(DWORD stage)
+                 for (k = 0; k < g_sampler_cache_n; k++)
+                     ID3D11SamplerState_Release(g_sampler_cache[k].state);
+                 g_sampler_cache_n = 0;
++                d3d8_bake_gen++;                /* a baked draw may hold one (18.90) */
+                 memset(g_sampler_hash, 0, sizeof(g_sampler_hash));
+                 h = sampler_slot(&sd);
+             }
+@@ -386,9 +450,10 @@ HRESULT d3d8_states_init(void)
+ void d3d8_states_shutdown(void)
+ {
+     int i;
+-    if (g_blend_state)  { ID3D11BlendState_Release(g_blend_state); g_blend_state = NULL; }
+-    if (g_ds_state)     { ID3D11DepthStencilState_Release(g_ds_state); g_ds_state = NULL; }
+-    if (g_raster_state) { ID3D11RasterizerState_Release(g_raster_state); g_raster_state = NULL; }
++    g_blend_state = NULL;               /* owned by the cache (18.90) */
++    g_ds_state = NULL;
++    g_raster_state = NULL;
++    state_cache_release();
+     for (i = 0; i < 4; i++)
+         g_sampler_states[i] = NULL;         /* owned by the cache */
+     for (i = 0; i < (int)g_sampler_cache_n; i++)
+diff --git a/src/d3d/d3d8_vsh.c b/src/d3d/d3d8_vsh.c
+index 476b47f..2c61533 100644
+--- a/src/d3d/d3d8_vsh.c
++++ b/src/d3d/d3d8_vsh.c
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include "d3d8_internal.h"
++#include <d3d11_1.h>
+ #include "d3d8_vsh.h"
+ #include <d3dcompiler.h>
+ #include <string.h>
+@@ -98,6 +99,27 @@ static BOOL g_vsh_constants_dirty = TRUE;
+ /* D3D11 constant buffer for VS constants */
+ static ID3D11Buffer *g_vsh_cb = NULL;
+ 
++/* The block a baked draw uploaded into it last, while it still holds it
++ * (twoc notes 18.90; NULL: something else since). */
++static const float *g_vsh_baked_last;
++
++/* The constants ring (local perf change, twoc notes 18.90): with D3D11.1's
++ * constant-buffer offsets, a frame's captured draws (and the baked draws
++ * whose constants moved) put their 192 registers into one large buffer,
++ * each at its own offset, bound at it; a baked draw whose constants are as
++ * captured binds the capture's block and copies nothing. The ring starts
++ * over (DISCARD) when full, and every block in it goes (g_kring_gen); one
++ * that may not hold the next frame starts over at the frame's first capture.
++ * Without D3D11.1's offsets (or a buffer): g_vsh_cb as before. */
++#define KRING_SIZE (32u << 20)
++#define VSH_REGS_BYTES ((UINT)sizeof(NV2AVSConstants))
++static ID3D11DeviceContext1 *g_ctx1;
++static ID3D11Buffer *g_kring;
++static int g_kring_state;               /* 0 not tried, 1 ready, -1 not there */
++static UINT g_kring_off = KRING_SIZE, g_kring_gen = 1, g_kring_frame_bytes;
++static BOOL g_kring_cur_ok;             /* g_vsh_constants is at g_kring_cur in the ring now */
++static UINT g_kring_cur, g_kring_cur_gen;
++
+ /* Shader cache: maps microcode hash to compiled shader + input layout */
+ typedef struct {
+     uint32_t            hash;
+@@ -660,6 +682,8 @@ static VshCacheEntry *cache_insert(uint32_t hash)
+         VshCacheEntry *evict = &g_vsh_cache[idx];
+         int j;
+ 
++        d3d8_bake_gen++;                /* a baked draw may hold its shader or layouts (18.90) */
++
+         if (evict->vs)
+             ID3D11VertexShader_Release(evict->vs);
+         if (evict->vs_blob)
+@@ -793,6 +817,7 @@ HRESULT d3d8_vsh_init(void)
+     memset(&g_vsh_constants, 0, sizeof(g_vsh_constants));
+     g_vsh_slot_count = 0;
+     g_vsh_constants_dirty = TRUE;
++    g_vsh_baked_last = NULL;
+ 
+     /* Create the constant buffer for VS constants (192 * float4 = 3072 bytes) */
+     memset(&cbd, 0, sizeof(cbd));
+@@ -832,6 +857,17 @@ void d3d8_vsh_shutdown(void)
+         ID3D11Buffer_Release(g_vsh_cb);
+         g_vsh_cb = NULL;
+     }
++    if (g_kring) {
++        ID3D11Buffer_Release(g_kring);
++        g_kring = NULL;
++    }
++    if (g_ctx1) {
++        ID3D11DeviceContext1_Release(g_ctx1);
++        g_ctx1 = NULL;
++    }
++    g_kring_state = 0;
++    g_kring_cur_ok = FALSE;
++    g_kring_gen++;
+ 
+     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
+     g_vsh_slot_count = 0;
+@@ -919,6 +955,7 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
+     }
+ 
+     g_vsh_constants_dirty = TRUE;
++    g_kring_cur_ok = FALSE;
+ }
+ 
+ BOOL d3d8_vsh_is_programmable(DWORD handle)
+@@ -926,6 +963,74 @@ BOOL d3d8_vsh_is_programmable(DWORD handle)
+     return (handle >= 0x10000) ? TRUE : FALSE;
+ }
+ 
++/* The constants ring there, made the first time (FALSE: not on this device). */
++static BOOL kring_ready(void)
++{
++    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
++    D3D11_FEATURE_DATA_D3D11_OPTIONS o;
++    D3D11_BUFFER_DESC bd;
++
++    if (g_kring_state)
++        return g_kring_state > 0;
++    g_kring_state = -1;
++    memset(&o, 0, sizeof(o));
++    if (FAILED(ID3D11Device_CheckFeatureSupport(d3d8_GetD3D11Device(), D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof(o))) ||
++        !o.ConstantBufferOffsetting ||
++        FAILED(ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D11DeviceContext1, (void **)&g_ctx1))) {
++        fprintf(stderr, "D3D8 VSH: no constant-buffer offsets (D3D11.1): baked draws upload their constants\n");
++        return FALSE;
++    }
++    memset(&bd, 0, sizeof(bd));
++    bd.ByteWidth = KRING_SIZE;
++    bd.Usage = D3D11_USAGE_DYNAMIC;
++    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++    if (FAILED(ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL, &g_kring))) {
++        ID3D11DeviceContext1_Release(g_ctx1);
++        g_ctx1 = NULL;
++        fprintf(stderr, "D3D8 VSH: the constants ring wasn't made: baked draws upload their constants\n");
++        return FALSE;
++    }
++    g_kring_state = 1;
++    fprintf(stderr, "D3D8 VSH: constants ring %u MB (D3D11.1 offsets) for baked draws\n", KRING_SIZE >> 20);
++    return TRUE;
++}
++
++/* 192 registers from `p` into the ring; returns their offset, (UINT)-1 if
++ * the map failed. */
++static UINT kring_write(const void *p)
++{
++    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    D3D11_MAP mt = D3D11_MAP_WRITE_NO_OVERWRITE;
++    UINT off = g_kring_off;
++
++    if (off + VSH_REGS_BYTES > KRING_SIZE) {
++        off = 0;
++        mt = D3D11_MAP_WRITE_DISCARD;
++        g_kring_gen++;
++    }
++    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_kring, 0, mt, 0, &mapped)))
++        return (UINT)-1;
++    memcpy((BYTE *)mapped.pData + off, p, VSH_REGS_BYTES);
++    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_kring, 0);
++    g_kring_off = off + VSH_REGS_BYTES;     /* 3072 bytes: 256-byte (16-constant) steps */
++    g_kring_frame_bytes += VSH_REGS_BYTES;
++    return off;
++}
++
++/* Slot b1 bound to the ring's block at `off`. */
++static void kring_bind(UINT off)
++{
++    UINT first = off / 16, num = VSH_REGS_BYTES / 16;
++
++    if (g_d3d8_bound.vs_cb[1] != g_kring || g_d3d8_bound.vs_cb1_first != first) {
++        g_d3d8_bound.vs_cb[1] = g_kring;
++        g_d3d8_bound.vs_cb1_first = first;
++        ID3D11DeviceContext1_VSSetConstantBuffers1(g_ctx1, 1, 1, &g_kring, &first, &num);
++    }
++}
++
+ BOOL d3d8_vsh_prepare_draw(DWORD handle)
+ {
+     ID3D11DeviceContext *ctx;
+@@ -973,6 +1078,26 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
+     if (layout)
+         d3d8_bind_layout(ctx, layout);
+ 
++    /* A captured draw (twoc notes 18.90): its constants in the ring, where
++     * the baked draws after it find them (the block before when they haven't
++     * changed since); g_vsh_cb is uploaded again at the next draw that isn't. */
++    if (d3d8_bake_capturing() && kring_ready()) {
++        if (!g_kring_cur_ok || g_kring_cur_gen != g_kring_gen) {
++            UINT off = kring_write(&g_vsh_constants);
++            if (off != (UINT)-1) {
++                g_kring_cur = off;
++                g_kring_cur_gen = g_kring_gen;
++                g_kring_cur_ok = TRUE;
++            }
++        }
++        if (g_kring_cur_ok && g_kring_cur_gen == g_kring_gen) {
++            kring_bind(g_kring_cur);
++            g_vsh_constants_dirty = TRUE;
++            g_vsh_baked_last = NULL;
++            return TRUE;
++        }
++    }
++
+     /* Update constant buffer if dirty */
+     if (g_vsh_constants_dirty) {
+         hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_cb,
+@@ -982,6 +1107,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
+             ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_cb, 0);
+         }
+         g_vsh_constants_dirty = FALSE;
++        g_vsh_baked_last = NULL;
+     }
+ 
+     /* Bind constant buffer to slot b1 */
+@@ -989,3 +1115,60 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
+ 
+     return TRUE;
+ }
++
++/* The captured draw's place in the ring (k_gen 0: not there). */
++void d3d8_vsh_bake(D3D8Baked *b)
++{
++    b->k_gen = 0;
++    if (b->vsh && g_kring_state > 0 && g_d3d8_bound.vs_cb[1] == g_kring && g_kring_cur_ok &&
++        g_kring_cur_gen == g_kring_gen) {
++        b->k_gen = g_kring_gen;
++        b->k_first = g_kring_cur;
++    }
++}
++
++/* A baked draw's program constants (twoc notes 18.90), bound in b1: the
++ * capture's block in the ring when they are as captured (not `fresh`) and it
++ * still holds it, else `consts` (all 192) put in the ring, or (no ring)
++ * uploaded into g_vsh_cb unless it is the block uploaded by the baked draw
++ * before and not `fresh`. g_vsh_constants is left as it is, so the next
++ * ordinary draw uploads it again. */
++void d3d8_vsh_baked_consts(const D3D8Baked *b, const float *consts, BOOL fresh)
++{
++    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
++    D3D11_MAPPED_SUBRESOURCE mapped;
++
++    if (g_kring_state > 0) {
++        UINT off;
++        if (!fresh && b->k_gen && b->k_gen == g_kring_gen) {
++            kring_bind(b->k_first);
++            return;
++        }
++        if ((off = kring_write(consts)) != (UINT)-1) {
++            kring_bind(off);
++            g_vsh_constants_dirty = TRUE;
++            return;
++        }
++    }
++    d3d8_bind_vs_cb(ctx, 1, g_vsh_cb);
++    if (!fresh && consts == g_vsh_baked_last)
++        return;
++    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
++        memcpy(mapped.pData, consts, sizeof(g_vsh_constants));
++        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_cb, 0);
++    }
++    g_vsh_constants_dirty = TRUE;
++    g_vsh_baked_last = fresh ? NULL : consts;
++}
++
++/* The frame's captures begin again (d3d8_BakeReset): a block given before
++ * may be at the same address with other constants now. */
++void d3d8_vsh_bake_reset(void)
++{
++    g_vsh_baked_last = NULL;
++    /* The ring starts over now if the frame may not fit (a quarter more than
++     * the last frame put in it, and 1 MB). */
++    if ((UINT64)g_kring_off + g_kring_frame_bytes + g_kring_frame_bytes / 4 + (1u << 20) > KRING_SIZE)
++        g_kring_off = KRING_SIZE;
++    g_kring_frame_bytes = 0;
++}
+diff --git a/tests/d3d8_smoke/test_a8.c b/tests/d3d8_smoke/test_a8.c
+index 0a2b963..a5ba2f4 100644
+--- a/tests/d3d8_smoke/test_a8.c
++++ b/tests/d3d8_smoke/test_a8.c
+@@ -33,6 +33,13 @@ UINT d3d8_GetNumLights(void) { return 0; }
+ /* What the draws last bound (d3d8_states.c, not linked here). */
+ D3D8Bound g_d3d8_bound;
+ 
++/* Baked draws' parts from d3d8_states.c, d3d8_device.c and d3d8_vsh.c
++ * (twoc notes 18.90), not linked here. */
++UINT d3d8_bake_gen = 1;
++void *d3d8_bake_alloc(size_t n) { (void)n; return NULL; }
++void d3d8_vsh_bake_reset(void) { }
++BOOL d3d8_bake_capturing(void) { return FALSE; }
++
+ /* Model successful programmable-VS preparation without Xbox microcode.
+  * Bind real D3D11 vertex state so pixel preparation must preserve it
+  * (through the bind record, as d3d8_vsh.c does). */

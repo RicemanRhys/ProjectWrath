@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 16:38:53 +0000
+Subject: [PATCH] Local-only: d3d8_MemStats, the bake's memory and the rings'
+ sizes and peaks for twoc's memory log (measurement only: a byte counter at
+ each bake chunk made, the falling peaks at file scope, the constants ring's
+ last and largest frame; output unchanged; twoc step 99)
+
+---
+ src/d3d/d3d8_device.c   | 18 +++++++++++++++++-
+ src/d3d/d3d8_internal.h | 12 ++++++++++++
+ src/d3d/d3d8_vsh.c      | 12 ++++++++++++
+ 3 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d/d3d8_device.c b/src/d3d/d3d8_device.c
+index dda841e..349513a 100644
+--- a/src/d3d/d3d8_device.c
++++ b/src/d3d/d3d8_device.c
+@@ -1160,6 +1160,9 @@ typedef struct bake_chunk {
+ #define BAKE_CHUNK (256u * 1024u)
+ static bake_chunk *g_bake_heads[2], *g_bake_cur;
+ static int g_bake_set;
++static size_t g_bake_bytes;             /* twoc step 99: the chunks' bytes (never freed), for d3d8_MemStats */
++static unsigned g_bake_chunks;
++static UINT up_peak, ib_peak;           /* d3d8_BakeReset's falling peaks (file scope since step 99) */
+ #define g_bake_head g_bake_heads[g_bake_set]
+ 
+ void *d3d8_bake_alloc(size_t n)
+@@ -1178,6 +1181,8 @@ void *d3d8_bake_alloc(size_t n)
+         c->used = 0;
+         c->cap = cap;
+         c->next = NULL;
++        g_bake_bytes += sizeof(bake_chunk) + cap;
++        g_bake_chunks++;
+         if (g_bake_cur) {
+             c->next = g_bake_cur->next;
+             g_bake_cur->next = c;
+@@ -1206,7 +1211,6 @@ void d3d8_BakeReset(void)
+      * held them the frame before (twoc's cut 3) upload little most frames and
+      * all of it after the rings start over, so the last frame alone let a
+      * ring fill up in the middle of a frame now and then. */
+-    static UINT up_peak, ib_peak;
+     up_peak = g_up_frame_bytes > up_peak - up_peak / 256 ? g_up_frame_bytes : up_peak - up_peak / 256;
+     ib_peak = g_ib_frame_bytes > ib_peak - ib_peak / 256 ? g_ib_frame_bytes : ib_peak - ib_peak / 256;
+     if ((UINT64)g_up_ring_offset + up_peak + up_peak / 4 + (1u << 20) > UP_RING_BUFFER_SIZE)
+@@ -1222,6 +1226,18 @@ void d3d8_BakeReset(void)
+     d3d8_shaders_bake_reset();
+ }
+ 
++void d3d8_MemStats(D3D8MemStats *s)
++{
++    s->bake_bytes = g_bake_bytes;
++    s->bake_chunks = g_bake_chunks;
++    s->up_size = UP_RING_BUFFER_SIZE;
++    s->up_peak = up_peak;
++    s->ib_size = IB_RING_BUFFER_SIZE;
++    s->ib_peak = ib_peak;
++    s->ring_gen = g_ring_gen;
++    d3d8_vsh_mem_stats(&s->k_size, &s->k_frame, &s->k_peak, &s->k_gen);
++}
++
+ BOOL d3d8_bake_capturing(void)
+ {
+     return g_bake_cap != NULL;
+diff --git a/src/d3d/d3d8_internal.h b/src/d3d/d3d8_internal.h
+index df29b52..2423b63 100644
+--- a/src/d3d/d3d8_internal.h
++++ b/src/d3d/d3d8_internal.h
+@@ -656,6 +656,18 @@ HRESULT d3d8_DrawBakedAgain(const D3D8Baked *old, D3D8Baked *now, ID3D11ShaderRe
+                             const D3DMATRIX *const ff_m[3], D3DPRIMITIVETYPE pt, UINT prim_count, UINT nverts,
+                             const void *idx, const void *verts, UINT stride, D3D8UpKept *kept);
+ 
++/* Twoc step 99 (measurement only): the bake's memory and the rings, for the
++ * memory log. Any thread; read without a lock (sizes only). */
++typedef struct {
++    size_t bake_bytes;                  /* the bake's chunks, both sets (never freed) */
++    unsigned bake_chunks;
++    UINT up_size, up_peak, ib_size, ib_peak;    /* the rings and their falling peaks of a frame's uploads */
++    UINT k_size, k_frame, k_peak;       /* the constants ring, the last frame's bytes, the most in a frame */
++    UINT ring_gen, k_gen;               /* how often the rings started over (+1) */
++} D3D8MemStats;
++void d3d8_MemStats(D3D8MemStats *s);
++void d3d8_vsh_mem_stats(UINT *size, UINT *frame, UINT *peak, UINT *gen);
++
+ /* The modules' parts (d3d8_shaders.c, d3d8_combiners.c, d3d8_vsh.c) */
+ void *d3d8_bake_alloc(size_t n);
+ int d3d8_shaders_bake_again(D3D8Baked *b, const D3DMATRIX *const ff_m[3]);
+diff --git a/src/d3d/d3d8_vsh.c b/src/d3d/d3d8_vsh.c
+index 0ed01a5..fc7efdf 100644
+--- a/src/d3d/d3d8_vsh.c
++++ b/src/d3d/d3d8_vsh.c
+@@ -118,6 +118,7 @@ static ID3D11DeviceContext1 *g_ctx1;
+ static ID3D11Buffer *g_kring;
+ static int g_kring_state;               /* 0 not tried, 1 ready, -1 not there */
+ static UINT g_kring_off = KRING_SIZE, g_kring_gen = 1, g_kring_frame_bytes;
++static UINT g_kring_peak, g_kring_last; /* twoc step 99: the most bytes a frame put in it, the last frame's */
+ static BOOL g_kring_cur_ok;             /* g_vsh_constants is at g_kring_cur in the ring now */
+ static UINT g_kring_cur, g_kring_cur_gen;
+ 
+@@ -1232,5 +1233,16 @@ void d3d8_vsh_bake_reset(void)
+      * the last frame put in it, and 1 MB). */
+     if ((UINT64)g_kring_off + g_kring_frame_bytes + g_kring_frame_bytes / 4 + (1u << 20) > KRING_SIZE)
+         g_kring_off = KRING_SIZE;
++    if (g_kring_frame_bytes > g_kring_peak)
++        g_kring_peak = g_kring_frame_bytes;
++    g_kring_last = g_kring_frame_bytes;
+     g_kring_frame_bytes = 0;
+ }
++
++void d3d8_vsh_mem_stats(UINT *size, UINT *frame, UINT *peak, UINT *gen)
++{
++    *size = g_kring_state == 1 ? KRING_SIZE : 0;
++    *frame = g_kring_last;
++    *peak = g_kring_peak;
++    *gen = g_kring_gen;
++}

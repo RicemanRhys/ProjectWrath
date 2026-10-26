@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 02:43:42 +0000
+Subject: [PATCH] Local-only: the context-call timing's comment: twoc times one
+ draw in 32 now (step 95)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/d3d/d3d8_internal.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/d3d/d3d8_internal.h b/src/d3d/d3d8_internal.h
+index f55ce34..acb559a 100644
+--- a/src/d3d/d3d8_internal.h
++++ b/src/d3d/d3d8_internal.h
+@@ -31,7 +31,7 @@ IDirect3DDevice8 *d3d8_GetDevice(void);
+  * copies and binds use) is timed with QueryPerformanceCounter and adds its
+  * ticks to d3d8_ctx_ticks and one to d3d8_ctx_calls; otherwise it costs a
+  * load and a branch. The caller turns it on around the work it measures
+- * (twoc: one draw in 16) and reads the sums; the calls themselves are made
++ * (twoc: one draw in 32) and reads the sums; the calls themselves are made
+  * exactly as before, in the same order, on the same context.
+  * ================================================================ */
+ 

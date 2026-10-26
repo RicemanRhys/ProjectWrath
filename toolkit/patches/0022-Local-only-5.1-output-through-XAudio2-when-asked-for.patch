@@ -1,0 +1,484 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 08:01:48 +0000
+Subject: [PATCH] Local-only: 5.1 output through XAudio2 when asked for and the
+ device has the speakers
+
+RECOMP_SPEAKERS=5.1 opens the default device's mastering voice at its own
+channel count; if its speakers include FL FR C LFE and a surround pair, a
+6-channel source voice (FL FR C LFE BL BR) is mapped onto them with an
+explicit matrix (surrounds to the side pair when there is one). Otherwise
+stereo, exactly as without the switch. The DSP stage then writes the speaker
+bins to their channels and the HRTF submix bins to their corners at the
+stereo gain (mixdown_51), and the monitor submits six channels.
+mcpx_apu_output_channels() reports the result. Checks: RECOMP_APU_FORCE_51=1
+opens 5.1 on any device; RECOMP_APU_OUT_WAV=PATH writes what the monitor
+submits. Default: unchanged (crash_twoc notes 18.58).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apu/apu.h         |   5 ++
+ src/apu/apu_core.c    |  72 +++++++++++++++++++-
+ src/apu/apu_dsp.c     |  41 +++++++++++-
+ src/apu/apu_state.h   |   6 ++
+ src/apu/apu_xaudio2.c | 149 ++++++++++++++++++++++++++++++++++++++++--
+ src/apu/apu_xaudio2.h |   9 ++-
+ 6 files changed, 273 insertions(+), 9 deletions(-)
+
+diff --git a/src/apu/apu.h b/src/apu/apu.h
+index 69e5323..a08ffed 100644
+--- a/src/apu/apu.h
++++ b/src/apu/apu.h
+@@ -37,6 +37,11 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d);
+  * the output unchanged. Any thread, any time. */
+ void mcpx_apu_set_voice_gain(int stream, float gain);
+ 
++/* The output's channels: 2 (stereo) or 6 (5.1: RECOMP_SPEAKERS=5.1 and a
++ * default device with those speakers; see apu_xaudio2.c), 0 before the
++ * output is open. *device_channels (may be NULL) gets the default device's
++ * channel count when 5.1 was asked for, else 0. Set at the APU's start. */
++int mcpx_apu_output_channels(int *device_channels);
+ 
+ /* ============================================================
+  * Software mixer - DirectSound buffer bridge
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 809578c..fc1fc91 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -209,9 +209,11 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+     d->monitor.stream = NULL;
+     d->monitor.queued_bytes_low = 1024;
+     d->monitor.queued_bytes_high = 3072;
++    d->monitor.channels = 2;
+ 
+     /* Try XAudio2 first (lower latency) */
+     if (xa2_init()) {
++        d->monitor.channels = xa2_channels();
+         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+         return;
+     }
+@@ -292,13 +294,54 @@ static void monitor_stats(MCPXAPUState *d)
+     g_mon_stats.t0_ms = now;
+ }
+ 
++/* RECOMP_APU_OUT_WAV=PATH (a check, notes 18.58): every frame the monitor
++ * hands the device, as a 16-bit 48 kHz WAV with the output's channels
++ * (FL FR C LFE BL BR at 5.1). The header's sizes are brought up to date
++ * every second, so a run that is killed leaves a readable file. */
++static void out_wav(const int16_t *samples, int n, int ch)
++{
++    static int state;                   /* 0 not looked, 1 writing, -1 off */
++    static FILE *f;
++    static uint32_t bytes, since;
++    uint32_t hdr[11];
++
++    if (state == 0) {
++        const char *p = getenv("RECOMP_APU_OUT_WAV");
++        state = -1;
++        if (p && *p && (f = fopen(p, "wb")) != NULL) {
++            state = 1;
++            fprintf(stderr, "[APU] output written to %s (%d channels)\n", p, ch);
++        }
++    }
++    if (state < 0)
++        return;
++    if (bytes == 0 || since >= 48000u * 2 * ch) {
++        hdr[0] = 0x46464952; hdr[1] = 36 + bytes; hdr[2] = 0x45564157;     /* RIFF size WAVE */
++        hdr[3] = 0x20746D66; hdr[4] = 16;                                  /* "fmt " 16 */
++        hdr[5] = 1u | ((uint32_t)ch << 16); hdr[6] = 48000;                 /* PCM, channels, rate */
++        hdr[7] = 48000u * 2 * ch; hdr[8] = (uint32_t)(2 * ch) | (16u << 16);
++        hdr[9] = 0x61746164; hdr[10] = bytes;                              /* "data" size */
++        fseek(f, 0, SEEK_SET);
++        fwrite(hdr, sizeof(hdr), 1, f);
++        fseek(f, 0, SEEK_END);
++        fflush(f);
++        since = 0;
++    }
++    fwrite(samples, 2 * ch, n, f);
++    bytes += 2 * ch * n;
++    since += 2 * ch * n;
++}
++
+ /* Hands this APU frame's 256 samples to the device. The frame thread holds
+  * d->lock; a wait for room in the device's queue lets it go. */
+ static void monitor_submit(MCPXAPUState *d)
+ {
+     int wait_loops = 0;
++    const int16_t *out = d->monitor.channels == 6 ? (const int16_t *)d->monitor.frame_buf6
++                                                  : (const int16_t *)d->monitor.frame_buf;
+ 
+     g_mon_stats.frames++;
++    out_wav(out, MIXER_FRAME_SAMPLES, d->monitor.channels);
+ 
+     if (xa2_is_active()) {
+         while (xa2_buffers_queued() >= xa2_max_buffers() && wait_loops++ < 50) {
+@@ -308,7 +351,7 @@ static void monitor_submit(MCPXAPUState *d)
+         }
+         if (xa2_buffers_queued() == 0)
+             g_mon_stats.underruns++;
+-        if (!xa2_submit_samples((const int16_t *)d->monitor.frame_buf, MIXER_FRAME_SAMPLES))
++        if (!xa2_submit_samples(out, MIXER_FRAME_SAMPLES))
+             g_mon_stats.dropped++;
+         return;
+     }
+@@ -378,11 +421,38 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
+         mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
+     }
+ 
++    /* At 5.1 the pipeline wrote frame_buf6; the tone and the mixer above
++     * (and the VP monitor point) go to its front pair. */
++    if (d->monitor.channels == 6) {
++        if (g_audio_muted) {
++            memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
++        } else {
++            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
++                for (int ch = 0; ch < 2; ch++) {
++                    int m = d->monitor.frame_buf6[i][ch] + d->monitor.frame_buf[i][ch];
++                    d->monitor.frame_buf6[i][ch] =
++                        (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m);
++                }
++            }
++        }
++    }
++
+     monitor_submit(d);
+     memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
++    if (d->monitor.channels == 6)
++        memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
+     monitor_stats(d);
+ }
+ 
++int mcpx_apu_output_channels(int *device_channels)
++{
++    if (device_channels)
++        *device_channels = xa2_device_channels();
++    if (xa2_is_active())
++        return xa2_channels();
++    return g_waveout.initialized ? 2 : 0;
++}
++
+ /* ============================================================
+  * Throttle (timing control for frame pacing)
+  * ============================================================ */
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index 194d88b..16789e1 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -155,6 +155,43 @@ static void mixdown_weights(MCPXAPUState *d, float wl[NUM_MIXBINS], float wr[NUM
+     }
+ }
+ 
++/* 5.1 (notes 18.58): the speaker bins go to their own channels at unity
++ * (bins 0-5 are FL FR C LFE BL BR), and each HRTF submix bin to its
++ * speaker at the same gain as in stereo: the submixes 0 and 2 are the front
++ * pair, 1 and 3 the back (Crash names bins 6, 8, 7, 9: DirectSound's
++ * crosstalk front left, back left, front right, back right). Nothing is
++ * folded down, and the sends stay dropped as in stereo.
++ * RECOMP_APU_MIXDOWN's older mixdowns are stereo only. */
++static void mixdown_51(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int off)
++{
++    static const int speaker_of_submix[4] = { 0, 4, 1, 5 };
++    float w[6][NUM_MIXBINS];
++    const float gx = mcpx_apu_xtlk_gain();
++
++    memset(w, 0, sizeof(w));
++    for (int c = 0; c < 6; c++)
++        w[c][c] = 1.0f;
++    for (int k = 0; k < 4; k++) {
++        int b = d->vp.hrtf_submix[k], used = 0;
++        if (b < 6 || b >= NUM_MIXBINS)
++            continue;
++        for (int c = 0; c < 6; c++)
++            used |= w[c][b] != 0.0f;
++        if (!used)
++            w[speaker_of_submix[k]][b] = gx;
++    }
++    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
++        for (int c = 0; c < 6; c++) {
++            float s = 0.0f;
++            for (int b = 0; b < NUM_MIXBINS; ++b)
++                s += w[c][b] * mixbins[b][i];
++            if (s > 1.0f) s = 1.0f;
++            if (s < -1.0f) s = -1.0f;
++            d->monitor.frame_buf6[off + i][c] = (int16_t)(s * 32767.0f);
++        }
++    }
++}
++
+ static void dsp_ack_frame(MCPXAPUState *d)
+ {
+     int i;
+@@ -220,7 +257,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
+ 
+     dsp_ack_frame(d);
+ 
+-    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
++    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP && d->monitor.channels == 6) {
++        mixdown_51(d, mixbins, off);
++    } else if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+         float wl[NUM_MIXBINS], wr[NUM_MIXBINS];
+         mixdown_weights(d, wl, wr);
+         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 1a00fe5..1b88e4d 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -502,6 +502,12 @@ struct MCPXAPUState {
+     struct {
+         McpxApuDebugMonitorPoint point;
+         int16_t frame_buf[256][2];
++        /* 5.1 output (notes 18.58): channels is 6 when the device took
++         * 5.1, and the DSP stage then writes frame_buf6 (FL FR C LFE BL BR);
++         * frame_buf keeps the test tone and the software mixer, which go
++         * to the front pair. */
++        int channels;
++        int16_t frame_buf6[256][6];
+         void *stream; /* SDL_AudioStream* - stubbed */
+         int queued_bytes_low, queued_bytes_high;
+     } monitor;
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+index a6ebd4b..46dc0e4 100644
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -8,6 +8,7 @@
+ 
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include "apu_xaudio2.h"
+ 
+@@ -24,6 +25,7 @@
+ 
+ #define XA2_SAMPLE_RATE   48000
+ #define XA2_CHANNELS      2
++#define XA2_MAX_CHANNELS  6      /* 5.1, when asked for and the device takes it */
+ #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
+ /* The monitor submits each 256-sample APU frame as it is produced (5.3 ms),
+  * so the ring is sized in those: 16 of them queue at most ~85 ms. */
+@@ -32,15 +34,132 @@
+ static IXAudio2               *g_xa2 = NULL;
+ static IXAudio2MasteringVoice *g_xa2_master = NULL;
+ static IXAudio2SourceVoice    *g_xa2_source = NULL;
+-static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
++static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][XA2_MAX_CHANNELS];
+ static int                     g_xa2_next_buf = 0;
+ static int                     g_xa2_initialized = 0;
+ static int                     g_xa2_frames_written = 0;
++static int                     g_xa2_channels = XA2_CHANNELS;   /* the source voice's: 2, or 6 */
++static int                     g_xa2_device_channels = 0;       /* probed when 5.1 is asked for */
++
++/* 5.1 OUTPUT (notes 18.58). RECOMP_SPEAKERS=5.1 asks for six channels, in
++ * the order FL FR C LFE BL BR (the MCPX's speaker bins 0-5). The default
++ * device's mastering voice is opened at its own channel count; when its
++ * speakers include front left/right, center, LFE and a surround pair (back,
++ * or side), the source voice takes six channels and an explicit matrix puts
++ * each on its speaker (the surrounds on the side pair when there is one, as
++ * 5.1 is laid out in 7.1). Otherwise the output is the stereo below, exactly
++ * as without the switch, and the [XA2] line says why.
++ * RECOMP_APU_FORCE_51=1 (a check) opens 5.1 on any device: Windows then
++ * downmixes it to the device's channels. */
++#define SPK_FL  0x001u
++#define SPK_FR  0x002u
++#define SPK_FC  0x004u
++#define SPK_LFE 0x008u
++#define SPK_BL  0x010u
++#define SPK_BR  0x020u
++#define SPK_SL  0x200u
++#define SPK_SR  0x400u
++
++static int want_51(int *force)
++{
++    const char *e = getenv("RECOMP_SPEAKERS"), *f = getenv("RECOMP_APU_FORCE_51");
++
++    *force = f && *f && strcmp(f, "0") != 0;
++    return e && strcmp(e, "5.1") == 0;
++}
++
++/* The device channel that carries `bit` of `mask`. */
++static int spk_index(DWORD mask, DWORD bit)
++{
++    int n = 0;
++    DWORD b;
++
++    for (b = 1; b < bit; b <<= 1)
++        if (mask & b)
++            n++;
++    return n;
++}
++
++/* The mastering and source voices at 5.1, or 0 with neither made. */
++static int open_51(int force)
++{
++    static const DWORD front[4] = { SPK_FL, SPK_FR, SPK_FC, SPK_LFE };
++    XAUDIO2_VOICE_DETAILS det;
++    WAVEFORMATEXTENSIBLE wfx;
++    DWORD mask = 0, bl, br;
++    float matrix[XA2_MAX_CHANNELS * 32];
++    HRESULT hr;
++    int i, devch;
++
++    hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
++        force ? XA2_MAX_CHANNELS : XAUDIO2_DEFAULT_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[XA2] 5.1: CreateMasteringVoice failed: 0x%08lX; stereo\n", hr);
++        g_xa2_master = NULL;
++        return 0;
++    }
++    g_xa2_master->lpVtbl->GetVoiceDetails(g_xa2_master, &det);
++    g_xa2_master->lpVtbl->GetChannelMask(g_xa2_master, &mask);
++    devch = (int)det.InputChannels;
++    g_xa2_device_channels = devch;
++    bl = (mask & SPK_SL) && (mask & SPK_SR) ? SPK_SL : SPK_BL;
++    br = bl == SPK_SL ? SPK_SR : SPK_BR;
++    for (i = 0; i < 4 && (mask & front[i]); i++)
++        ;
++    if (i < 4 || !(mask & bl) || !(mask & br) || devch > 32) {
++        fprintf(stderr, "[XA2] 5.1 asked for, but the default device takes %d channels (mask 0x%lX): stereo\n",
++                devch, (unsigned long)mask);
++        g_xa2_master->lpVtbl->DestroyVoice(g_xa2_master);
++        g_xa2_master = NULL;
++        return 0;
++    }
++
++    memset(&wfx, 0, sizeof(wfx));
++    wfx.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
++    wfx.Format.nChannels       = XA2_MAX_CHANNELS;
++    wfx.Format.nSamplesPerSec  = XA2_SAMPLE_RATE;
++    wfx.Format.wBitsPerSample  = 16;
++    wfx.Format.nBlockAlign     = XA2_MAX_CHANNELS * 2;
++    wfx.Format.nAvgBytesPerSec = XA2_SAMPLE_RATE * wfx.Format.nBlockAlign;
++    wfx.Format.cbSize          = sizeof(wfx) - sizeof(WAVEFORMATEX);
++    wfx.Samples.wValidBitsPerSample = 16;
++    wfx.dwChannelMask = SPK_FL | SPK_FR | SPK_FC | SPK_LFE | SPK_BL | SPK_BR;
++    {   /* KSDATAFORMAT_SUBTYPE_PCM, without ksguid.lib */
++        static const GUID pcm = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
++        wfx.SubFormat = pcm;
++    }
++    hr = IXAudio2_CreateSourceVoice(g_xa2, &g_xa2_source,
++        &wfx.Format, 0, XAUDIO2_DEFAULT_FREQ_RATIO, NULL, NULL, NULL);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[XA2] 5.1: CreateSourceVoice failed: 0x%08lX; stereo\n", hr);
++        g_xa2_source = NULL;
++        g_xa2_master->lpVtbl->DestroyVoice(g_xa2_master);
++        g_xa2_master = NULL;
++        return 0;
++    }
++
++    /* matrix[d * 6 + s]: source channel s to device channel d */
++    memset(matrix, 0, sizeof(matrix));
++    {
++        const DWORD to[XA2_MAX_CHANNELS] = { SPK_FL, SPK_FR, SPK_FC, SPK_LFE, bl, br };
++        for (i = 0; i < XA2_MAX_CHANNELS; i++)
++            matrix[spk_index(mask, to[i]) * XA2_MAX_CHANNELS + i] = 1.0f;
++    }
++    hr = g_xa2_source->lpVtbl->SetOutputMatrix(g_xa2_source, NULL, XA2_MAX_CHANNELS, devch, matrix,
++                                               XAUDIO2_COMMIT_NOW);
++    if (FAILED(hr))
++        fprintf(stderr, "[XA2] 5.1: SetOutputMatrix failed: 0x%08lX (XAudio2's own mapping)\n", hr);
++    g_xa2_channels = XA2_MAX_CHANNELS;
++    fprintf(stderr, "[XA2] 5.1 on a device of %d channels (mask 0x%lX), surrounds to its %s pair%s\n",
++            devch, (unsigned long)mask, bl == SPK_SL ? "side" : "back",
++            force ? " (RECOMP_APU_FORCE_51)" : "");
++    return 1;
++}
+ 
+ int xa2_init(void)
+ {
+     HRESULT hr;
+-    int com_initialized;
++    int com_initialized, force;
+     WAVEFORMATEX wfx = { 0 };
+ 
+     if (g_xa2_initialized) return 1;
+@@ -58,6 +177,10 @@ int xa2_init(void)
+         goto fail;
+     }
+ 
++    g_xa2_channels = XA2_CHANNELS;
++    if (want_51(&force) && open_51(force))
++        goto start;
++
+     hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
+         XA2_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
+     if (FAILED(hr)) {
+@@ -79,6 +202,7 @@ int xa2_init(void)
+         goto fail;
+     }
+ 
++start:
+     hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+     if (FAILED(hr)) {
+         fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
+@@ -89,8 +213,9 @@ int xa2_init(void)
+     g_xa2_initialized = 1;
+     g_xa2_frames_written = 0;
+ 
+-    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
+-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
++    fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz %s 16-bit, %d x %d-sample buffers)\n",
++            XA2_SAMPLE_RATE, g_xa2_channels == XA2_MAX_CHANNELS ? "5.1" : "stereo", XA2_NUM_BUFS,
++            XA2_BUF_SAMPLES);
+     return 1;
+ 
+ fail:
+@@ -144,10 +269,10 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
+ 
+     idx = g_xa2_next_buf;
+     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
+-    memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
++    memcpy(g_xa2_bufs[idx], samples, copy_samples * g_xa2_channels * sizeof(int16_t));
+ 
+     memset(&xbuf, 0, sizeof(xbuf));
+-    xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
++    xbuf.AudioBytes = copy_samples * g_xa2_channels * sizeof(int16_t);
+     xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
+ 
+     hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+@@ -177,6 +302,16 @@ int xa2_max_buffers(void)
+     return XA2_NUM_BUFS;
+ }
+ 
++int xa2_channels(void)
++{
++    return g_xa2_initialized ? g_xa2_channels : 0;
++}
++
++int xa2_device_channels(void)
++{
++    return g_xa2_device_channels;
++}
++
+ #else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+ 
+ int  xa2_init(void)                                   { return 0; }
+@@ -186,5 +321,7 @@ int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return
+ int  xa2_get_buffer_size(void)                        { return 0; }
+ int  xa2_buffers_queued(void)                         { return 0; }
+ int  xa2_max_buffers(void)                            { return 0; }
++int  xa2_channels(void)                               { return 0; }
++int  xa2_device_channels(void)                        { return 0; }
+ 
+ #endif /* _WIN32 */
+diff --git a/src/apu/apu_xaudio2.h b/src/apu/apu_xaudio2.h
+index e393e7b..655ec35 100644
+--- a/src/apu/apu_xaudio2.h
++++ b/src/apu/apu_xaudio2.h
+@@ -15,9 +15,16 @@ void xa2_shutdown(void);
+ /* Returns 1 if XAudio2 is active. */
+ int xa2_is_active(void);
+ 
+-/* Submit interleaved stereo 16-bit samples. Returns 1 if accepted. */
++/* Submit interleaved 16-bit samples, xa2_channels() per frame (stereo, or
++ * FL FR C LFE BL BR). Returns 1 if accepted. */
+ int xa2_submit_samples(const int16_t *samples, int num_samples);
+ 
++/* The channels the output takes: 2, or 6 when RECOMP_SPEAKERS=5.1 asked for
++ * 5.1 and the default device has those speakers; 0 when not initialized. */
++int xa2_channels(void);
++/* The default device's channel count, read when 5.1 was asked for (0: not). */
++int xa2_device_channels(void);
++
+ /* Get the preferred buffer size in samples. */
+ int xa2_get_buffer_size(void);
+ 

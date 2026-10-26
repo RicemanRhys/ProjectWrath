@@ -1,0 +1,428 @@
+# The test packages (notes 18.83; step 97, notes 18.100: two targets): a folder that runs the game on another
+# Windows PC.
+#
+#   powershell -NoProfile -ExecutionPolicy Bypass -File twoc\tools\package\make_package.ps1
+#       [-Target LegionGo | Nitro5] [-Out DIR] [-Exe crash_twoc.exe] [-GameFiles DIR] [-Save UDATA_DIR] [-Force] [-Pgo]
+#
+# -Target (step 97): LegionGo (the default; Desktop\Crash\LegionGoPackage) or Nitro5 (the Acer Nitro 5 laptop;
+# Desktop\Crash\Nitro5Package). Each has its own ProjectWrath.ini, README.txt and Test notes.txt in
+# targets\<Target>\; the launchers and tools in files\ are shared, less those a target leaves out (Nitro5: the
+# Vulkan probe's). Two packages of one exe: -Pgo for the first, then -Exe twoc\build_pgo\Release\crash_twoc.exe
+# for the second (PACKAGE.txt reads PGO from that build's CMakeCache.txt).
+#
+# Step 109 (notes 18.112): the project is Project Wrath. The build's crash_twoc.exe goes in as ProjectWrath.exe (the
+# exe takes its names from its own file name: ProjectWrath.ini, ProjectWrath.*.log, the window "Project Wrath"), the
+# launchers are "Play Project Wrath*.bat", and each package is a folder named ProjectWrath-<Target> inside the
+# user's own folder for it (Desktop\Crash\LegionGoPackage\ProjectWrath-LegionGo, ...\Nitro5Package\ProjectWrath-Nitro5,
+# ...\SharePackage\ProjectWrath-Share): the folder a player is given carries the name, the user's folders stay
+# where they are. A package of the layout before (PACKAGE.txt directly in the user's folder) is replaced with
+# -Force.
+#
+# -Pgo (step 95, notes 18.98): the exe built with profile-guided optimisation in a build folder of its own
+# (twoc\build_pgo; twoc\build, the ordinary build, untouched): linked instrumented (TWOC_PGO=GEN), trained by
+# pgo_train.sh through the sweep harness (a scratch copy in %TEMP%: cast_bug's start gliding, avalanch, the upstairs
+# room, ~6 minutes with the menu, intro and hub on the way; needs Git Bash, the repo's .venv and this PC's display),
+# then linked again with the counts (TWOC_PGO=USE). /fp stays precise. PACKAGE.txt says so.
+#
+# Makes DIR (default: Desktop\Crash\<Target>Package\ProjectWrath-<Target>) with:
+#   ProjectWrath.exe (the build's crash_twoc.exe); every DLL it imports is part of Windows 10/11 (checked here with dumpbin /dependents; the list
+#     goes into PACKAGE.txt). Since step 108 the Visual C++ runtime is linked static (TWOC_STATIC_CRT, /MT): no
+#     runtime DLL is shipped, and an exe or DLL that still imports one (vcruntime140*.dll, msvcp140*.dll,
+#     api-ms-win-crt-*) stops the script. A build with -DTWOC_STATIC_CRT=OFF ships vcruntime140*.dll app-local as
+#     before (from Visual Studio's redist folder)
+#   xemu_apu.dll (step 108, notes 18.111): the audio library (the APU from xemu, LGPL), from the exe's own build
+#     folder; its imports are checked the same way. The Share package also gets Source\xemu_apu-source_*.zip, its
+#     complete source (make_apu_source_package.ps1)
+#   game_files\ (default.xbe and Crashdat\ from -GameFiles; never UDATA (saves), UDATA_backups, TDATA
+#     or our analysis files; -Save DIR copies DIR in as game_files\UDATA, only when asked)
+#   tools\vrrprobe.exe (built from twoc\tools\diag\vrrprobe.cpp) and tools\collect_logs.ps1
+#   files\: Play Project Wrath.bat, Play Project Wrath (72 fps test).bat, Play Project Wrath (ack wait test).bat,
+#     Play Project Wrath (bake off).bat, Play Project Wrath (Vulkan probe).bat (notes 18.90),
+#     Play Project Wrath (fullscreen start test).bat, Play Project Wrath (fullscreen old way).bat (notes 18.93),
+#     Play Project Wrath (safe settings).bat (notes 18.96: RECOMP_IGNORE_INI=1, the defaults, the ini untouched),
+#     Collect logs.bat; from targets\<Target>\: ProjectWrath.ini (the device's settings), README.txt, Test notes.txt
+#     (text files written with CRLF line ends)
+#   THIRD_PARTY_LICENSES.txt (twoc/, from third_party_licenses.py)
+#   LICENSE.txt (step 108): LICENSE.package.txt filled in: this project's own code under MIT (twoc\LICENSE's text,
+#     whose copyright line is the one place the owner's name is written), the third-party parts under their own
+#     licences, the audio code, and no game files or rights to the game included or granted
+#   PACKAGE.txt: the build (commits, exe hash, link-time code generation), the imported DLLs and
+#     where each comes from
+#
+# The exe finds game_files\ in its working directory (Play Project Wrath.bat sets it to its own folder)
+# and ProjectWrath.ini next to itself, so the folder runs from anywhere. An existing DIR is
+# replaced only with -Force and only if it holds a PACKAGE.txt (one this script made).
+# Build first: cmake --build twoc\build --config Release --parallel
+# Then smoke-test a scratch copy (never the package itself): smoke_test.ps1 (notes 18.91).
+#
+# Step 110 (notes 18.113): -Venv DIR (the harness's Python for -Pgo; default the repo's .venv) and -SdlSource DIR (SDL's
+# source for the builds; default twoc\build\_deps\sdl3-src) let make_release.ps1 build in a clean checkout, where
+# -GameFiles may go with -Target Share -Pgo (the training's disc files only: the package still gets none). The
+# Share package's README.txt is made from twoc\public\README.md (readme_txt.py): one text for the public
+# repository and the package.
+#
+# -Target Share (step 107, notes 18.110): the package for other people. NO game files: the exe's first-run setup
+# makes them from the player's own disc image. No ProjectWrath.ini (the first start writes one), no test launchers,
+# no vrrprobe, no Test notes; README.txt for strangers, LICENSE.txt (as every package's), Play Project Wrath.bat
+# and the safe-settings launcher, Collect logs.bat (which scrubs the user name, home folder and PC name). Default
+# folder Desktop\Crash\SharePackage\ProjectWrath-Share. package_audit.ps1 checks it at the end (no game file by name, size or hash,
+# no user or PC name, no logs or saves) and the script fails if the audit does.
+param(
+    [ValidateSet('LegionGo', 'Nitro5', 'Share')][string]$Target = 'LegionGo',
+    [string]$Out,
+    [string]$Exe,
+    [string]$GameFiles,
+    [string]$Save,
+    [switch]$Force,
+    [switch]$Pgo,
+    [string]$Venv,
+    [string]$SdlSource
+)
+$ErrorActionPreference = 'Stop'
+$here = $PSScriptRoot
+$twoc = Split-Path -Parent (Split-Path -Parent $here)
+$repo = Split-Path -Parent $twoc
+# Step 109: the package's own folder, ProjectWrath-<Target>, inside the user's folder for that target.
+$container = $null
+if (-not $Out) {
+    $container = Join-Path ([Environment]::GetFolderPath('Desktop')) "Crash\${Target}Package"
+    $Out = Join-Path $container "ProjectWrath-$Target"
+}
+$targetDir = Join-Path $here "targets\$Target"
+$share = $Target -eq 'Share'
+$need = if ($share) { @() } else { @('ProjectWrath.ini', 'README.txt', 'Test notes.txt') }
+foreach ($f in $need) {
+    if (-not (Test-Path (Join-Path $targetDir $f))) { throw "No $f in $targetDir" }
+}
+$publicReadme = Join-Path $twoc 'public\README.md'      # step 110: the Share package's README.txt is made from it
+if ($share -and -not (Test-Path $publicReadme)) { throw "No $publicReadme (the Share package's README)" }
+if (-not $Venv) { $Venv = Join-Path $repo '.venv' }
+if (-not $SdlSource) { $SdlSource = Join-Path $twoc 'build\_deps\sdl3-src' }
+$tests = @('Play Project Wrath (72 fps test).bat', 'Play Project Wrath (Vulkan probe).bat',
+           'Play Project Wrath (ack wait test).bat', 'Play Project Wrath (bake off).bat',
+           'Play Project Wrath (fullscreen start test).bat', 'Play Project Wrath (fullscreen old way).bat')
+$leaveOut = @{ 'LegionGo' = @(); 'Nitro5' = @('Play Project Wrath (Vulkan probe).bat'); 'Share' = $tests }[$Target]
+$targetName = @{ 'LegionGo' = 'Legion Go'; 'Nitro5' = 'Acer Nitro 5'; 'Share' = 'Share (for other people, no game files)' }[$Target]
+if ($Pgo -and $Exe) { throw '-Pgo builds its own exe: leave -Exe out' }
+if ($share -and ($Save -or ($GameFiles -and -not $Pgo))) { throw '-Target Share ships no game files and no saves: leave -GameFiles (but for -Pgo''s training) and -Save out' }
+if (-not $Exe) { $Exe = Join-Path $twoc 'build\Release\crash_twoc.exe' }
+if (-not $GameFiles) { $GameFiles = Join-Path $repo 'game_files' }
+if (-not $Pgo) { $Exe = (Resolve-Path $Exe).Path }
+if (-not $share) {          # the Share package needs no game files (the PGO training uses them, below)
+    $GameFiles = (Resolve-Path $GameFiles).Path
+    if (-not (Test-Path (Join-Path $GameFiles 'default.xbe'))) { throw "No default.xbe in $GameFiles" }
+    if (-not (Test-Path (Join-Path $GameFiles 'Crashdat'))) { throw "No Crashdat\ in $GameFiles" }
+} elseif ($Pgo) {
+    $GameFiles = (Resolve-Path $GameFiles).Path
+}
+
+# Visual Studio: dumpbin, vcvars64 (for vrrprobe) and the redistributable C++ runtime.
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vs) { throw 'Visual Studio with the C++ tools not found (vswhere)' }
+$vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+$dumpbin = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe') | Sort-Object FullName | Select-Object -Last 1
+$crt = Get-ChildItem (Join-Path $vs 'VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT') -Directory |
+       Where-Object { $_.FullName -match '\\\d+\.\d+\.\d+\\' } | Sort-Object FullName | Select-Object -Last 1
+if (-not $dumpbin -or -not $crt) { throw 'dumpbin or the VC redist CRT folder not found' }
+
+# -Pgo (step 95): instrumented, trained, linked again, in twoc\build_pgo.
+$pgoLine = 'off'
+if ($Pgo) {
+    $msvcBin = Split-Path -Parent $dumpbin.FullName
+    $pgort = Join-Path $msvcBin 'pgort140.dll'
+    $pgosweep = Join-Path $msvcBin 'pgosweep.exe'
+    if (-not (Test-Path $pgort) -or -not (Test-Path $pgosweep)) { throw "pgort140.dll or pgosweep.exe not in $msvcBin" }
+    $git = (Get-Command git -ErrorAction Stop).Source        # Git for Windows: ...\Git\cmd\git.exe
+    $bash = Join-Path (Split-Path -Parent (Split-Path -Parent $git)) 'bin\bash.exe'
+    if (-not (Test-Path $bash)) { throw "Git Bash not found beside $git" }
+    if (-not (Test-Path (Join-Path $Venv 'Scripts\python.exe'))) { throw "The harness's Python ($Venv) not found" }
+    $pb = Join-Path $twoc 'build_pgo'
+    $pgd = Join-Path $pb 'crash_twoc.pgd'
+    $cfg = @('-S', $twoc, '-B', $pb, "-DTWOC_PGO_PGD=$pgd")
+    $sdl = $SdlSource                                   # SDL from the ordinary build's download (no network)
+    if (Test-Path (Join-Path $sdl 'CMakeLists.txt')) { $cfg += "-DFETCHCONTENT_SOURCE_DIR_SDL3=$sdl" }
+    $t0 = Get-Date
+    Write-Host 'PGO: the instrumented build (twoc\build_pgo)'
+    & cmake @cfg -DTWOC_PGO=GEN | Out-Null
+    if ($LASTEXITCODE) { throw 'cmake configure (GEN) failed' }
+    & cmake --build $pb --config Release --parallel | Out-Null
+    if ($LASTEXITCODE) { throw 'the instrumented build failed' }
+    Get-ChildItem $pb -Filter '*.pgc' | Remove-Item
+    # The harness: a scratch copy of the sweep folder, its own root\game_files (default.xbe, an empty UDATA, Crashdat
+    # as a junction), the instrumented exe beside pgort140.dll; a path without spaces for the harness's arguments.
+    $h = Join-Path $env:TEMP ('twoc_pgo_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $junction = Join-Path $h 'root\game_files\Crashdat'
+    try {
+        Copy-Item -Recurse (Join-Path $twoc 'tools\diag\sweep') $h
+        Copy-Item (Join-Path $here 'pgo_train.sh') $h
+        foreach ($sh in Get-ChildItem $h -Filter '*.sh') {      # bash wants LF (a checkout may have made them CRLF)
+            [IO.File]::WriteAllText($sh.FullName, ([IO.File]::ReadAllText($sh.FullName) -replace "`r`n", "`n"),
+                                    (New-Object Text.UTF8Encoding($false)))
+        }
+        New-Item -ItemType Directory -Force -Path (Join-Path $h 'root\game_files\UDATA'), (Join-Path $h 'runs'),
+            (Join-Path $h 'pgi') | Out-Null
+        Copy-Item (Join-Path $GameFiles 'default.xbe') (Join-Path $h 'root\game_files')
+        New-Item -ItemType Junction -Path $junction -Target (Join-Path $GameFiles 'Crashdat') | Out-Null
+        Copy-Item (Join-Path $pb 'Release\crash_twoc.exe'), (Join-Path $pb 'Release\xemu_apu.dll'), $pgort (Join-Path $h 'pgi')
+        Write-Host "PGO: training (cast_bug, avalanch, upstairs) in $h"
+        $t1 = Get-Date
+        & $bash (Join-Path $h 'pgo_train.sh') ($h -replace '\\', '/') (Join-Path $h 'pgi\crash_twoc.exe') $pb $pgosweep
+        $trainMin = ((Get-Date) - $t1).TotalMinutes
+        if ($LASTEXITCODE) { throw 'the PGO training failed' }
+    } finally {
+        $tl = Join-Path $pb 'pgo_train_logs'                                # the training's logs, kept
+        New-Item -ItemType Directory -Force -Path $tl | Out-Null
+        Get-ChildItem (Join-Path $h 'runs') -Filter 'pgt_*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.txt', '.log' } | Copy-Item -Destination $tl
+        if (Test-Path $junction) { [IO.Directory]::Delete($junction) }     # the link only, never what it points to
+        if ((Test-Path $h) -and -not (Test-Path $junction)) { Remove-Item -Recurse -Force $h }
+    }
+    $pgc = @(Get-ChildItem $pb -Filter '*.pgc')
+    if ($pgc.Count -lt 3) { throw "PGO: $($pgc.Count) count files from the training, 3 expected" }
+    Write-Host 'PGO: linking again with the counts'
+    & cmake @cfg -DTWOC_PGO=USE | Out-Null
+    if ($LASTEXITCODE) { throw 'cmake configure (USE) failed' }
+    & cmake --build $pb --config Release --parallel | Out-Null
+    if ($LASTEXITCODE) { throw 'the PGO build failed' }
+    $Exe = (Resolve-Path (Join-Path $pb 'Release\crash_twoc.exe')).Path
+    $pgoLine = ('on (twoc\build_pgo: trained {0:N1} min on cast_bug, avalanch and the upstairs room, {1} count files;' +
+                ' {2:N1} min in all)') -f $trainMin, $pgc.Count, ((Get-Date) - $t0).TotalMinutes
+    Write-Host "PGO: $pgoLine"
+}
+
+# A stale exe is the easiest mistake: say so if a source file is newer.
+$exeTime = (Get-Item $Exe).LastWriteTime
+$newer = Get-ChildItem -Recurse -File (Join-Path $twoc 'src'), (Join-Path $repo 'xboxrecomp\src') -Include *.c, *.cpp, *.h |
+         Where-Object { $_.LastWriteTime -gt $exeTime } | Select-Object -First 3
+if ($newer) { Write-Warning ("Sources newer than the exe (rebuild?): " + (($newer | ForEach-Object Name) -join ', ')) }
+
+# The audio library (step 108): built beside the exe.
+$apuDll = Join-Path (Split-Path -Parent $Exe) 'xemu_apu.dll'
+if (-not (Test-Path $apuDll)) { throw "No xemu_apu.dll beside $Exe (the game doesn't start without it): build first" }
+$apuNewer = Get-ChildItem -File (Join-Path $repo 'xboxrecomp\src\apu'), (Join-Path $twoc 'apu_dll') |
+            Where-Object { $_.LastWriteTime -gt (Get-Item $apuDll).LastWriteTime } | Select-Object -First 3
+if ($apuNewer) { Write-Warning ("Sources newer than xemu_apu.dll (rebuild?): " + (($apuNewer | ForEach-Object Name) -join ', ')) }
+
+# The exe's and the DLL's imports, each placed: shipped beside it, or part of Windows.
+function Imports([string]$f) { & $dumpbin.FullName /nologo /dependents $f | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() } }
+$deps = @(Imports $Exe)
+$apuDeps = @(Imports $apuDll)
+$shipped = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'concrt140.dll')
+$windows = @{
+    'kernel32.dll' = 'Windows'; 'user32.dll' = 'Windows'; 'gdi32.dll' = 'Windows'; 'imm32.dll' = 'Windows';
+    'ole32.dll' = 'Windows'; 'oleaut32.dll' = 'Windows'; 'advapi32.dll' = 'Windows'; 'setupapi.dll' = 'Windows';
+    'shell32.dll' = 'Windows'; 'dwmapi.dll' = 'Windows'; 'winmm.dll' = 'Windows'; 'dbghelp.dll' = 'Windows';
+    'version.dll' = 'Windows'; 'shcore.dll' = 'Windows'; 'hid.dll' = 'Windows'; 'cfgmgr32.dll' = 'Windows';
+    'bcrypt.dll' = 'Windows (CNG; the game-files check''s SHA-256, notes 18.86)';
+    'd3d11.dll' = 'Windows (DirectX 11)'; 'dxgi.dll' = 'Windows (DirectX 11)';
+    'd3dcompiler_47.dll' = 'Windows 8.1+ (the HLSL compiler)';
+    'xinput1_4.dll' = 'Windows 8+ (XInput)'; 'xaudio2_9.dll' = 'Windows 10+ (XAudio2)';
+    'mfplat.dll' = 'Windows (Media Foundation; missing on N editions without the Media Feature Pack)';
+    'mfreadwrite.dll' = 'Windows (Media Foundation; missing on N editions without the Media Feature Pack)'
+}
+# Step 108: the runtime linked static (the exe's build folder's CMakeCache.txt says so) imports no runtime DLL.
+$cache0 = Join-Path (Split-Path -Parent (Split-Path -Parent $Exe)) 'CMakeCache.txt'
+$staticCrt = (Test-Path $cache0) -and -not (Select-String -Quiet -Pattern '^TWOC_STATIC_CRT:BOOL=OFF' $cache0)
+if ($staticCrt) {
+    $rt = @($deps + $apuDeps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt|vccorlib|ucrtbase)|^api-ms-win-crt-' } | Select-Object -Unique)
+    if ($rt.Count) { throw "The runtime is meant to be linked static, but these are imported: $($rt -join ', ') (rebuild?)" }
+}
+$depLines = @()
+$apuLines = @()
+foreach ($d in ($deps + $apuDeps | Select-Object -Unique)) {
+    $k = $d.ToLower()
+    if ($shipped -contains $k) { $where = 'shipped in this folder (Visual C++ runtime ' + (Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $crt.FullName))) + ')' }
+    elseif ($k -like 'api-ms-win-crt-*') { $where = 'Windows 10+ (the Universal C runtime)' }
+    elseif ($windows.ContainsKey($k)) { $where = $windows[$k] }
+    else { throw "The exe imports $d, which this script doesn't know: decide whether to ship it" }
+    if ($shipped -contains $k -and -not (Test-Path (Join-Path $crt.FullName $d))) { throw "$d not in $($crt.FullName)" }
+    if ($deps -contains $d) { $depLines += ('  {0,-40} {1}' -f $d, $where) }
+    if ($apuDeps -contains $d) { $apuLines += ('  {0,-40} {1}' -f $d, $where) }
+}
+if ($apuDeps -contains 'crash_twoc.exe' -or $apuDeps -contains 'ProjectWrath.exe') { throw 'xemu_apu.dll imports from the exe: it must not' }
+
+# The folder. Step 109: the user's folder of the layout before (the package's files directly in it, PACKAGE.txt
+# there: a package this script made) is emptied first with -Force, then holds ProjectWrath-<Target>.
+if ($container -and (Test-Path (Join-Path $container 'PACKAGE.txt'))) {
+    if (-not $Force) { throw "$container holds a package of the layout before; -Force replaces it" }
+    Get-ChildItem -LiteralPath $container -Force | Where-Object { $_.Name -ne "ProjectWrath-$Target" } |
+        Remove-Item -Recurse -Force
+}
+if (Test-Path $Out) {
+    if (-not $Force) { throw "$Out exists; -Force replaces it" }
+    if (-not (Test-Path (Join-Path $Out 'PACKAGE.txt'))) { throw "$Out exists and has no PACKAGE.txt: not a package this script made, left alone" }
+    Remove-Item -Recurse -Force $Out
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $Out 'tools') | Out-Null
+$Out = (Resolve-Path $Out).Path
+
+Write-Host "Packaging into $Out"
+Copy-Item $Exe (Join-Path $Out 'ProjectWrath.exe')      # step 109: the build's crash_twoc.exe, as Project Wrath's
+Copy-Item $apuDll (Join-Path $Out 'xemu_apu.dll')
+foreach ($d in ($deps + $apuDeps | Select-Object -Unique)) { if ($shipped -contains $d.ToLower()) { Copy-Item (Join-Path $crt.FullName $d) $Out } }
+# The Share package: the audio library's complete source beside it (step 108; the LGPL's terms for the DLL).
+if ($share) {
+    $srcDir = Join-Path $Out 'Source'
+    New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
+    $xh = (& git -C (Join-Path $repo 'xboxrecomp') rev-parse --short HEAD); $th = (& git -C $repo rev-parse --short HEAD)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'make_apu_source_package.ps1') `
+        -Out (Join-Path $srcDir "xemu_apu-source_xboxrecomp-${xh}_ProjectWrath-${th}.zip")
+    if ($LASTEXITCODE) { throw 'make_apu_source_package.ps1 failed' }
+}
+
+# vrrprobe, built for the package (a temporary .cmd: vcvars64 needs cmd, and cmd wants CRLF). Not in the Share
+# package (a display test for the test devices).
+if (-not $share) {
+$tmp = Join-Path $env:TEMP ("twoc_pkg_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmp | Out-Null
+$src = Join-Path $twoc 'tools\diag\vrrprobe.cpp'
+$cmd = "@echo off`r`ncall `"$vcvars`" >nul 2>nul`r`ncd /d `"$tmp`"`r`n" +
+       "cl /nologo /std:c++17 /EHsc /O2 /MT `"$src`" /Fe:`"$Out\tools\vrrprobe.exe`" >`"$tmp\cl.log`" 2>&1`r`n"
+[IO.File]::WriteAllText((Join-Path $tmp 'b.cmd'), $cmd, [Text.Encoding]::ASCII)
+& cmd.exe /d /c (Join-Path $tmp 'b.cmd')
+if (-not (Test-Path "$Out\tools\vrrprobe.exe")) { Get-Content "$tmp\cl.log"; throw 'vrrprobe build failed' }
+Remove-Item -Recurse -Force $tmp
+}
+
+# The disc files, without saves (UDATA), their backups (UDATA_backups, notes 18.86), the title cache (TDATA) or our
+# analysis output. None in the Share package.
+if (-not $share) {
+& robocopy $GameFiles (Join-Path $Out 'game_files') /E /XD (Join-Path $GameFiles 'UDATA') (Join-Path $GameFiles 'UDATA_backups') `
+    (Join-Path $GameFiles 'TDATA') /XF crash_analysis.json /NFL /NDL /NJH /NJS /NP | Out-Null
+if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
+}
+if ($Save) {
+    $Save = (Resolve-Path $Save).Path
+    & robocopy $Save (Join-Path $Out 'game_files\UDATA') /E /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy of the save failed ($LASTEXITCODE)" }
+}
+
+# Step 109: where players report problems, ISSUES_URL in twoc\ISSUES_URL.txt (the one place it is written; the build
+# reads it too, tools\build_info.cmake): an https:// address, else (the placeholder) "to be announced". Every text file
+# below gets it in place of @ISSUES_URL@ (the Share README's "Where to report problems" line).
+$issuesFile = Join-Path $twoc 'ISSUES_URL.txt'
+$issues = ''
+if (Test-Path $issuesFile) {
+    $il = @(Get-Content $issuesFile | Where-Object { $_ -match '^\s*ISSUES_URL\s*=' }) | Select-Object -First 1
+    if ($il) {
+        $iv = ($il -replace '^\s*ISSUES_URL\s*=\s*', '').Trim()
+        if ($iv -match '^https://[A-Za-z0-9._~:/?#@!$&''()*+,;=%-]+$' -and $iv -notmatch '\[') { $issues = $iv }
+    }
+}
+$issuesText = if ($issues) { $issues } else { 'to be announced' }
+if (-not $issues) {
+    Write-Warning "ISSUES_URL in twoc\ISSUES_URL.txt is still the placeholder: the README says `"Where to report problems: to be announced`" and the About tab shows no link"
+}
+
+# The text files, with CRLF line ends whatever git checked out (cmd needs them in .bat files).
+function Put-Text([string]$from, [string]$to) {
+    $t = [IO.File]::ReadAllText($from) -replace "`r`n", "`n" -replace "`n", "`r`n"
+    $t = $t.Replace('@ISSUES_URL@', $issuesText)
+    [IO.File]::WriteAllText($to, $t, (New-Object Text.UTF8Encoding($false)))
+}
+$files = Join-Path $here 'files'
+foreach ($f in Get-ChildItem -File $files) {
+    if ($leaveOut -notcontains $f.Name) { Put-Text $f.FullName (Join-Path $Out $f.Name) }
+}
+if (Test-Path $targetDir) {         # step 110: the Share target's folder may be empty (its README is made below)
+    foreach ($f in Get-ChildItem -File $targetDir) { Put-Text $f.FullName (Join-Path $Out $f.Name) }     # step 97
+}
+if ($share) {                       # step 110: the README from twoc\public\README.md (the public repository's)
+    $rt = Join-Path $env:TEMP ('pw_readme_' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt')
+    & python -I (Join-Path $here 'readme_txt.py') $publicReadme $rt | Out-Null
+    if ($LASTEXITCODE -or -not (Test-Path $rt)) { throw 'readme_txt.py failed' }
+    Put-Text $rt (Join-Path $Out 'README.txt')
+    Remove-Item $rt
+}
+Put-Text (Join-Path $files 'tools\collect_logs.ps1') (Join-Path $Out 'tools\collect_logs.ps1')
+# Every third-party component's licence (notes 18.96; twoc/tools/package/third_party_licenses.py writes it).
+Put-Text (Join-Path $twoc 'THIRD_PARTY_LICENSES.txt') (Join-Path $Out 'THIRD_PARTY_LICENSES.txt')
+# LICENSE.txt (step 108): this project's own code under MIT, from twoc\LICENSE (its copyright line names the owner:
+# the one place to change it), with what it covers and what it doesn't.
+$mit = ([IO.File]::ReadAllText((Join-Path $twoc 'LICENSE')) -replace "`r`n", "`n").Trim()
+if ($mit -notmatch '(?m)^MIT License$' -or $mit -notmatch '(?m)^Copyright \(c\) ') { throw "twoc\LICENSE isn't the MIT licence with a copyright line" }
+$audio = 'The Xbox audio emulation, xemu_apu.dll beside ProjectWrath.exe, comes from xemu and is under the GNU ' +
+         'Lesser General Public License, version 2.1 or later; THIRD_PARTY_LICENSES.txt (part 7) has its notice and ' +
+         'the licence''s text' + $(if ($share) { ', and Source\ its complete source.' } else { '.' })
+$gameLine = if ($share) { 'This package has no game files: the first start sets them up from your own disc image.' }
+            else { 'This test package''s game_files folder is a copy of the owner''s own disc, for the owner''s own devices only: it is not to be given to anyone.' }
+function Wrap([string]$s, [int]$width, [string]$indent) {     # words to lines of at most $width, $indent before each
+    $lines = @(); $cur = ''
+    foreach ($w in $s -split ' ') {
+        if ($cur -and ($cur.Length + 1 + $w.Length) -gt $width) { $lines += $cur; $cur = $indent + $w }
+        elseif ($cur) { $cur += ' ' + $w } else { $cur = $indent + $w }
+    }
+    if ($cur) { $lines += $cur }
+    $lines -join "`n"
+}
+$lic = [IO.File]::ReadAllText((Join-Path $here 'LICENSE.package.txt')) -replace "`r`n", "`n"
+$lic = $lic.Replace('3. The audio code. @AUDIO@', (Wrap ('3. The audio code. ' + $audio) 112 '   ').Substring(3))
+$lic = $lic.Replace("   original Xbox disc (USA release). @GAMEFILES@", (Wrap ('original Xbox disc (USA release). ' + $gameLine) 112 '   '))
+$lic = $lic.Replace('@MIT@', $mit)
+if ($lic -match '@[A-Z]+@') { throw "LICENSE.package.txt: a placeholder left unfilled ($($Matches[0]))" }
+[IO.File]::WriteAllText((Join-Path $Out 'LICENSE.txt'), ($lic -replace "`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
+$owner = ([regex]::Match($mit, '(?m)^Copyright \(c\) .*$')).Value
+if ($owner -match '\[NAME TO BE CHOSEN BY THE OWNER\]') {
+    Write-Warning "LICENSE: the copyright line still reads `"$owner`": replace the placeholder in twoc\LICENSE before sharing"
+}
+
+# PACKAGE.txt: what this is built from.
+function Git1([string]$dir, [string[]]$a) { try { (& git -C $dir @a 2>$null | Select-Object -First 1) } catch { '' } }
+# The commits the exe's sources come from (twoc's src and build files; xboxrecomp), and whether
+# those had changes not committed (which the exe may then hold).
+$xrDir = Join-Path $repo 'xboxrecomp'
+$head = Git1 $repo @('log', '-1', '--format=%h %ad %s', '--date=iso', '--', 'twoc/src', 'twoc/CMakeLists.txt', 'twoc/seed_functions.json')
+$dirty = if (Git1 $repo @('status', '--porcelain', '--untracked-files=no', '--', 'twoc/src', 'twoc/CMakeLists.txt', 'twoc/seed_functions.json')) { ' (with uncommitted changes)' } else { '' }
+$xr = Git1 $xrDir @('log', '-1', '--format=%h %ad', '--date=iso')
+if (Git1 $xrDir @('status', '--porcelain', '--untracked-files=no')) { $xr += ' (with uncommitted changes)' }
+$hash = (Get-FileHash -Algorithm SHA256 (Join-Path $Out 'ProjectWrath.exe')).Hash
+$apuHash = (Get-FileHash -Algorithm SHA256 (Join-Path $Out 'xemu_apu.dll')).Hash
+# Link-time code generation (notes 18.87): the exe's build folder's CMakeCache.txt (build\Release\..).
+$cache = Join-Path (Split-Path -Parent (Split-Path -Parent $Exe)) 'CMakeCache.txt'
+$ltcg = if (-not (Test-Path $cache)) { "unknown (no CMakeCache.txt beside the exe's folder)" }
+        elseif (Select-String -Quiet -Pattern '^TWOC_LTCG:BOOL=ON' $cache) { 'on (TWOC_LTCG=ON)' }
+        else { 'off (TWOC_LTCG=OFF)' }
+# Step 97: an exe given with -Exe from a PGO build (an earlier -Pgo run's twoc\build_pgo) says so.
+if (-not $Pgo -and (Test-Path $cache) -and (Select-String -Quiet -Pattern '^TWOC_PGO:STRING=USE' $cache)) {
+    $pgoLine = "on (TWOC_PGO=USE: $(Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $Exe))), trained by an earlier -Pgo run)"
+}
+$gf = if ($share) { @() } else { Get-ChildItem -Recurse -File (Join-Path $Out 'game_files') }
+$gfLine = if ($share) { 'game_files: none (the player''s own disc image is set up at the first start; no saves)' }
+          else { "game_files: {0} files, {1:N0} MB{2}" -f $gf.Count, (($gf | Measure-Object Length -Sum).Sum / 1MB), $(if ($Save) { ", with a save copied in from $Save" } else { ', no saves' }) }
+$pkg = @(
+    "Project Wrath, $targetName package, made $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz') by tools\package\make_package.ps1",
+    "Target: $Target",
+    "",
+    "Build: twoc $head$dirty",
+    "       xboxrecomp $xr",
+    "ProjectWrath.exe: $((Get-Item $Exe).Length) bytes, built $($exeTime.ToString('yyyy-MM-dd HH:mm:ss')), SHA-256 $hash",
+    "                  (the build's exe, copied under the project's name)",
+    "                  link-time code generation: $ltcg",
+    "                  profile-guided optimisation: $pgoLine",
+    "                  Visual C++ runtime: $(if ($staticCrt) { 'linked static (/MT): no runtime DLL needed or shipped' } else { 'DLL (/MD): vcruntime140*.dll shipped beside it' })",
+    "xemu_apu.dll:     $((Get-Item $apuDll).Length) bytes, built $((Get-Item $apuDll).LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')), SHA-256 $apuHash",
+    "                  the audio library (xboxrecomp's src\apu from xemu, LGPL-2.1-or-later), loaded by the exe at the start$(if ($share) { '; its source: Source\' })",
+    $gfLine,
+    "Where to report problems: $issuesText$(if (-not $issues) { ' (ISSUES_URL in twoc\ISSUES_URL.txt is still the placeholder)' })",
+    "",
+    "DLLs the exe imports (dumpbin /dependents) and where they come from:"
+) + $depLines + @(
+    "",
+    "DLLs xemu_apu.dll imports:"
+) + $apuLines + @(
+    "",
+    "Loaded at run time when present: nvapi64.dll (NVIDIA only; the variable-refresh query), xaudio2_9.dll,",
+    "powrprof.dll and pdh.dll (Windows; the power log, notes 18.94), the GPU's own driver DLLs. Needs: 64-bit",
+    "Windows 10 or 11 with a DirectX 11 GPU."
+)
+[IO.File]::WriteAllText((Join-Path $Out 'PACKAGE.txt'), (($pkg -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+
+$all = Get-ChildItem -Recurse -File $Out
+Write-Host ("Done: {0}, {1} files, {2:N0} MB" -f $Out, $all.Count, (($all | Measure-Object Length -Sum).Sum / 1MB))
+$depLines | ForEach-Object { Write-Host $_ }
+# Step 107: the Share package is checked before anyone gets it (no game file, no user or PC name, no log or save).
+if ($share) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'package_audit.ps1') -Dir $Out
+    if ($LASTEXITCODE) { throw "package_audit.ps1 failed on ${Out}: see above" }
+}

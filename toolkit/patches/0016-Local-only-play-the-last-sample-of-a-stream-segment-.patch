@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 05:24:15 +0000
+Subject: [PATCH] Local-only: play the last sample of a stream segment or loop
+
+voice_get_samples reads while cbo <= ebo (ebo is the last sample), then
+moved on when cbo >= ebo: a request that filled up exactly at cbo == ebo
+went to the next segment, or back to the loop start, before sample ebo
+was played. The resampler asks for ~30 source samples a frame, so about
+one seam or loop point in 30 dropped a sample: a click. Same code in
+xemu. Now cbo > ebo.
+
+Local change approved by the user (notes 18.49), never pushed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apu/apu_vp.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 02f7cde..9590124 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -913,7 +913,13 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         }
+     }
+ 
+-    if (cbo >= ebo) {
++    /* ebo is the last sample (the loop above runs while cbo <= ebo), so the
++     * segment or buffer is done once cbo has passed it. This was cbo >= ebo,
++     * as in xemu: a request that filled up exactly at cbo == ebo moved on
++     * before sample ebo was played, dropping the last sample of a stream
++     * segment or of a loop about once in 30 (the resampler asks for ~30
++     * source samples a frame), a click each time (notes 18.49). */
++    if (cbo > ebo) {
+         if (stream) {
+             d->vp.ssl[v].ssl_seg += 1;
+             cbo = 0;

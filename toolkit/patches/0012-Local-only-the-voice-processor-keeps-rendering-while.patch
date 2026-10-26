@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RicemanRhys <176650384+RicemanRhys@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 11:59:40 +0000
+Subject: [PATCH] Local-only: the voice processor keeps rendering while the
+ front end is trapped
+
+The frame thread skipped the whole VP/DSP pipeline while FECTL's method
+mode was TRAPPED or HALTED, and ran the monitor alone, so every
+idle-voice trap was a gap of silence as long as the title's interrupt
+took to resume the front end. In a level where voices start and stop
+all the time (Crash's Arctic Antics), 13-23% of APU frames went out
+empty in 150-260 gaps of up to 21 ms every 10 s: the music played in
+fragments, at about half speed with repeats. A trap stops the method
+queue, not the voice processor, so:
+
+- The pipeline runs unless the front end is halted. FEMETHMODE is a
+  field and TRAPPED (0xE0) holds HALTED's bit (0x80), so the old bit
+  test also stopped it on a trap; the mode is now compared whole.
+- While trapped, the VP's list walk doesn't report more idle voices
+  (they would overwrite FEDECMETH/FEDECPARAM, which the ISR reads); they
+  are reported on the first frame after the resume.
+
+Loopback of the level, same deterministic attract demo: 921 and 933
+dropouts and 1,083 and 1,011 clicks in 60 s before, 96 and 136 after;
+the level music advances one second per second. The remaining gaps
+are the front end's short halted spells (0.4-2.4% of frames), left as
+they were. Beyond the 18.45 scope (monitor, pacing, resampler):
+flagged in the Crash notes.
+
+Never pushed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apu/apu_core.c | 14 +++++++++++---
+ src/apu/apu_vp.c   |  9 ++++++++-
+ 2 files changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 11539e2..5dd8a93 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -136,7 +136,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
+          * successful DirectSound create, that hang is not confined to audio.
+          *
+          * Resume whenever the write is not switching the block off; the thread
+-         * re-checks FECTL itself and idles again if it is halted or trapped. */
++         * re-checks FECTL itself and skips the pipeline while it is halted. */
+         {
+             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+             uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+@@ -492,12 +492,20 @@ static void *mcpx_apu_frame_thread(void *arg)
+          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+         throttle(d);
+ 
++        /* A trapped front end stops the method queue, not the voice
++         * processor: the VP keeps rendering the voices it has while the
++         * title's ISR handles the trap (and holds back further idle-voice
++         * methods, mcpx_apu_vp_frame). Skipping the whole frame there made
++         * every trap a gap of silence as long as the interrupt took: in a
++         * level with voices starting and stopping, 13-23% of frames in
++         * 150-260 gaps of up to 21 ms every 10 s. Halted still stops it.
++         * FEMETHMODE is a field, and TRAPPED (0xE0) holds HALTED's bit
++         * (0x80), so the mode is compared whole. */
+         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                 NV_PAPU_SECTL_XCNTMODE);
+         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
+-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
+-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
++                          (fectl & NV_PAPU_FECTL_FEMETHMODE) != NV_PAPU_FECTL_FEMETHMODE_HALTED;
+ 
+         if (apu_active && !g_test_tone.active) {
+             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 4dd4452..02f7cde 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -1244,7 +1244,14 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+ 
+             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+-                fe_method(d, SE2FE_IDLE_VOICE, v);
++                /* While the front end is trapped the idle voice waits, as an
++                 * SE2FE method waits in the hardware's queue: reporting it
++                 * would overwrite the trapped method and handle the ISR is
++                 * about to read. It is reported on the first frame after the
++                 * resume. */
++                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
++                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
++                    fe_method(d, SE2FE_IDLE_VOICE, v);
+             } else {
+                 /* Process voice directly (single-threaded) */
+                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
